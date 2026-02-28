@@ -1,0 +1,123 @@
+---
+title: "原型链与继承"
+description: "原型链机制、各种继承方式及 ES6 class 的本质"
+difficulty: "中级"
+tags: ["原型链", "继承", "class", "prototype"]
+category: "javascript"
+order: 3
+---
+
+## 核心概念
+
+JavaScript 是基于原型的语言。每个对象都有一个内部链接指向另一个对象（即原型），原型对象也有自己的原型，形成「原型链」。
+
+### 关键属性
+
+- `__proto__`：对象的原型（非标准，推荐用 `Object.getPrototypeOf()`）
+- `prototype`：函数的原型对象，用于构造实例
+- `constructor`：指向创建该对象的构造函数
+
+```javascript
+function Person(name) {
+  this.name = name;
+}
+
+const p = new Person('Alice');
+
+p.__proto__ === Person.prototype; // true
+Person.prototype.constructor === Person; // true
+Person.__proto__ === Function.prototype; // true
+```
+
+## 高频面试题
+
+### 1. instanceof 的原理是什么？
+
+`instanceof` 沿着原型链查找，判断构造函数的 `prototype` 是否出现在对象的原型链上。
+
+```javascript
+function myInstanceof(obj, Constructor) {
+  let proto = Object.getPrototypeOf(obj);
+  while (proto !== null) {
+    if (proto === Constructor.prototype) return true;
+    proto = Object.getPrototypeOf(proto);
+  }
+  return false;
+}
+```
+
+### 2. ES6 class 与构造函数的区别
+
+- class 声明不会提升（暂时性死区）
+- class 内部方法不可枚举
+- class 必须使用 `new` 调用
+- class 内部默认严格模式
+
+```javascript
+class Animal {
+  constructor(name) {
+    this.name = name;
+  }
+  speak() {
+    return `${this.name} makes a sound`;
+  }
+}
+
+// 等价的构造函数写法
+function Animal(name) {
+  this.name = name;
+}
+Animal.prototype.speak = function () {
+  return `${this.name} makes a sound`;
+};
+```
+
+### 3. 实现继承的几种方式
+
+```javascript
+// 1. 寄生组合继承（推荐）
+function inherit(Child, Parent) {
+  Child.prototype = Object.create(Parent.prototype);
+  Child.prototype.constructor = Child;
+}
+
+// 2. ES6 class extends
+class Dog extends Animal {
+  bark() {
+    return 'Woof!';
+  }
+}
+```
+
+## 深入追问
+
+### Object.create(null) 有什么用？
+
+创建一个没有原型的纯净对象，常用于创建字典/映射结构，避免原型链上属性的干扰（如 `hasOwnProperty`、`toString` 等）。
+
+### new 操作符做了什么？
+
+1. 创建空对象
+2. 将对象的 `__proto__` 指向构造函数的 `prototype`
+3. 执行构造函数，`this` 指向新对象
+4. 如果构造函数返回对象则返回该对象，否则返回新对象
+
+```javascript
+function myNew(Constructor, ...args) {
+  const obj = Object.create(Constructor.prototype);
+  const result = Constructor.apply(obj, args);
+  return result instanceof Object ? result : obj;
+}
+```
+
+## 手写练习
+
+> 实现 `Object.create` 的 polyfill：
+
+```javascript
+function objectCreate(proto) {
+  function F() {}
+  F.prototype = proto;
+  return new F();
+}
+```

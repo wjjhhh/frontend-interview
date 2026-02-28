@@ -1,0 +1,114 @@
+---
+title: "浏览器渲染原理"
+description: "从 URL 输入到页面渲染的完整流程，重绘回流优化"
+difficulty: "高级"
+tags: ["渲染流程", "重绘", "回流", "合成层", "V8"]
+category: "browser"
+order: 1
+---
+
+## 核心概念
+
+### 从输入 URL 到页面显示
+
+1. **DNS 解析** → 获取 IP 地址（浏览器缓存 → 系统缓存 → DNS 服务器）
+2. **TCP 三次握手** → 建立连接
+3. **TLS 握手**（HTTPS）→ 安全通道
+4. **发送 HTTP 请求** → 获取 HTML
+5. **解析 HTML** → 构建 DOM 树
+6. **解析 CSS** → 构建 CSSOM 树
+7. **合并** → 渲染树（Render Tree）
+8. **布局（Layout）** → 计算几何信息
+9. **绘制（Paint）** → 生成绘制指令
+10. **合成（Composite）** → GPU 合成显示
+
+## 高频面试题
+
+### 1. 重绘与回流
+
+**回流（Reflow/Layout）：** 元素几何属性变化，重新计算布局
+
+触发回流的操作：
+- 添加/删除/修改 DOM 元素
+- 修改宽高、位置、padding、margin、border
+- 读取 `offsetWidth`、`scrollTop`、`getBoundingClientRect()` 等（强制同步布局）
+- 修改字体大小、窗口 resize
+
+**重绘（Repaint）：** 元素外观变化，不影响几何信息
+
+触发重绘的操作：修改颜色、背景色、visibility、阴影等
+
+**回流一定触发重绘，重绘不一定触发回流。**
+
+### 2. 性能优化：减少回流
+
+```javascript
+// 1. 批量修改样式（一次回流）
+el.style.cssText = 'width:100px;height:100px;left:10px;';
+
+// 2. 使用 DocumentFragment 批量 DOM 操作
+const fragment = document.createDocumentFragment();
+for (let i = 0; i < 100; i++) {
+  fragment.appendChild(document.createElement('div'));
+}
+document.body.appendChild(fragment); // 只触发一次回流
+
+// 3. 读写分离（避免强制同步布局）
+// 错误：交替读写
+el.style.width = '100px';
+const h = el.offsetHeight; // 强制回流
+el.style.height = h + 'px';
+
+// 正确：先读后写
+const h = el.offsetHeight;
+el.style.width = '100px';
+el.style.height = h + 'px';
+
+// 4. CSS transform 代替 top/left（只触发合成）
+.animate {
+  transform: translate(100px, 100px); /* GPU 合成，无回流 */
+}
+```
+
+### 3. 合成层（Compositing Layer）
+
+创建独立合成层的条件：
+- `transform: translateZ(0)` 或 3D transform
+- `opacity` 动画
+- `will-change: transform/opacity`
+- `position: fixed`
+- `filter`
+
+```css
+/* 提升为合成层，动画由 GPU 处理 */
+.optimized {
+  will-change: transform;
+  /* 或 transform: translateZ(0); */
+}
+```
+
+## 深入追问
+
+### script 标签的加载策略
+
+```html
+<!-- 默认：同步，阻塞 HTML 解析 -->
+<script src="app.js"></script>
+
+<!-- async：并行下载，下载完立即执行（打断 HTML 解析） -->
+<script async src="analytics.js"></script>
+
+<!-- defer：并行下载，HTML 解析完后按序执行 -->
+<script defer src="app.js"></script>
+
+<!-- type="module"：自动 defer，支持 ESM -->
+<script type="module" src="main.js"></script>
+```
+
+### V8 引擎工作流程
+
+1. **Parse**：源码 → AST（抽象语法树）
+2. **Ignition**：AST → 字节码（Bytecode），直接解释执行
+3. **Profiler**：收集热点函数（Hot Function）信息
+4. **TurboFan**：热点函数 → 优化的机器码（JIT 编译）
+5. **Deoptimize**：假设失败（类型改变）→ 退回字节码

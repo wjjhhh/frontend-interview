@@ -1,0 +1,146 @@
+---
+title: "JavaScript Event Loop 机制详解"
+description: "宏任务、微任务、执行顺序及 Node.js 事件循环差异"
+difficulty: "高级"
+tags: ["Event Loop", "异步", "Promise", "宏任务", "微任务"]
+category: "javascript"
+order: 2
+---
+
+## 核心概念
+
+Event Loop（事件循环）是 JavaScript 实现异步编程的核心机制。JavaScript 是单线程语言，通过事件循环来处理异步操作。
+
+### 执行模型
+
+1. **调用栈（Call Stack）**：同步代码按顺序入栈执行
+2. **微任务队列（Microtask Queue）**：Promise.then、MutationObserver、queueMicrotask
+3. **宏任务队列（Macrotask Queue）**：setTimeout、setInterval、requestAnimationFrame、I/O
+
+### 执行顺序
+
+```
+同步代码 → 微任务队列（清空）→ 宏任务（取一个）→ 微任务队列（清空）→ ...
+```
+
+## 高频面试题
+
+### 1. 输出顺序题
+
+```javascript
+console.log('1');
+
+setTimeout(() => {
+  console.log('2');
+  Promise.resolve().then(() => console.log('3'));
+}, 0);
+
+Promise.resolve().then(() => {
+  console.log('4');
+  setTimeout(() => console.log('5'), 0);
+});
+
+console.log('6');
+```
+
+**答案：** `1 → 6 → 4 → 2 → 3 → 5`
+
+**解析：**
+1. 同步执行：输出 `1`，注册 setTimeout 回调，注册 Promise.then 回调，输出 `6`
+2. 微任务：执行 Promise.then，输出 `4`，注册新的 setTimeout
+3. 宏任务：执行第一个 setTimeout，输出 `2`，注册 Promise.then
+4. 微任务：输出 `3`
+5. 宏任务：输出 `5`
+
+### 2. async/await 与 Event Loop
+
+```javascript
+async function async1() {
+  console.log('async1 start');
+  await async2();
+  console.log('async1 end');
+}
+
+async function async2() {
+  console.log('async2');
+}
+
+console.log('script start');
+setTimeout(() => console.log('setTimeout'), 0);
+async1();
+new Promise((resolve) => {
+  console.log('promise1');
+  resolve();
+}).then(() => console.log('promise2'));
+console.log('script end');
+```
+
+**答案：**
+```text
+script start
+async1 start
+async2
+promise1
+script end
+promise2
+async1 end
+setTimeout
+```
+
+### 3. requestAnimationFrame 的执行时机
+
+`requestAnimationFrame` 的回调在浏览器下一次重绘之前执行，它的优先级在微任务之后、下一轮宏任务之前。
+
+## 深入追问
+
+### Node.js 的事件循环与浏览器有什么区别？
+
+Node.js 的事件循环分为 6 个阶段：
+1. **timers**：执行 setTimeout/setInterval 回调
+2. **pending callbacks**：执行系统级回调
+3. **idle, prepare**：内部使用
+4. **poll**：获取新的 I/O 事件
+5. **check**：执行 setImmediate 回调
+6. **close callbacks**：执行 close 事件回调
+
+Node.js 11+ 后，微任务行为与浏览器保持一致——每个宏任务执行完后立即清空微任务队列。
+
+### queueMicrotask vs Promise.resolve().then
+
+`queueMicrotask` 直接将回调加入微任务队列，而 `Promise.resolve().then` 会先创建 Promise 对象再添加微任务，前者更轻量。
+
+## 手写练习
+
+> 实现一个简易的任务调度器，支持并发限制：
+
+```javascript
+class Scheduler {
+  constructor(maxConcurrent) {
+    this.maxConcurrent = maxConcurrent;
+    this.running = 0;
+    this.queue = [];
+  }
+
+  add(promiseFn) {
+    return new Promise((resolve) => {
+      const task = () => {
+        this.running++;
+        promiseFn().then((result) => {
+          resolve(result);
+          this.running--;
+          if (this.queue.length > 0) {
+            const next = this.queue.shift();
+            next();
+          }
+        });
+      };
+
+      if (this.running < this.maxConcurrent) {
+        task();
+      } else {
+        this.queue.push(task);
+      }
+    });
+  }
+}
+```

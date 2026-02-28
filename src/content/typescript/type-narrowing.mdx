@@ -1,0 +1,107 @@
+---
+title: "TypeScript 类型收窄与类型守卫"
+description: "类型收窄技巧、自定义类型守卫、可辨识联合类型"
+difficulty: "中级"
+tags: ["类型收窄", "类型守卫", "联合类型"]
+category: "typescript"
+order: 2
+---
+
+## 核心概念
+
+类型收窄（Type Narrowing）是 TypeScript 控制流分析的核心，通过条件判断将宽类型缩小到具体类型。
+
+## 高频面试题
+
+### 1. 常见的类型收窄方式
+
+```typescript
+// typeof 收窄
+function padLeft(value: string | number) {
+  if (typeof value === 'number') {
+    return ' '.repeat(value); // value: number
+  }
+  return value; // value: string
+}
+
+// instanceof 收窄
+function getDate(value: Date | string) {
+  if (value instanceof Date) {
+    return value.getTime(); // value: Date
+  }
+  return new Date(value).getTime();
+}
+
+// in 操作符收窄
+interface Fish { swim: () => void }
+interface Bird { fly: () => void }
+
+function move(animal: Fish | Bird) {
+  if ('swim' in animal) {
+    animal.swim(); // animal: Fish
+  } else {
+    animal.fly();  // animal: Bird
+  }
+}
+```
+
+### 2. 自定义类型守卫
+
+```typescript
+// 使用 is 关键字
+function isFish(animal: Fish | Bird): animal is Fish {
+  return (animal as Fish).swim !== undefined;
+}
+
+// 使用 asserts 关键字
+function assertIsString(value: unknown): asserts value is string {
+  if (typeof value !== 'string') {
+    throw new Error('Not a string');
+  }
+}
+```
+
+### 3. 可辨识联合类型
+
+```typescript
+type Shape =
+  | { kind: 'circle'; radius: number }
+  | { kind: 'rectangle'; width: number; height: number }
+  | { kind: 'triangle'; base: number; height: number };
+
+function area(shape: Shape): number {
+  switch (shape.kind) {
+    case 'circle':
+      return Math.PI * shape.radius ** 2;
+    case 'rectangle':
+      return shape.width * shape.height;
+    case 'triangle':
+      return (shape.base * shape.height) / 2;
+  }
+}
+```
+
+## 深入追问
+
+### 穷尽性检查
+
+使用 `never` 类型确保 switch 处理了所有情况：
+
+```typescript
+function assertNever(x: never): never {
+  throw new Error('Unexpected value: ' + x);
+}
+
+function area(shape: Shape): number {
+  switch (shape.kind) {
+    case 'circle':
+      return Math.PI * shape.radius ** 2;
+    case 'rectangle':
+      return shape.width * shape.height;
+    case 'triangle':
+      return (shape.base * shape.height) / 2;
+    default:
+      return assertNever(shape); // 如果漏掉分支会编译报错
+  }
+}
+```

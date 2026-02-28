@@ -1,0 +1,166 @@
+---
+title: "前端高频算法题"
+description: "排序、链表、树、动态规划等前端面试常考算法"
+difficulty: "中级"
+tags: ["算法", "排序", "链表", "二叉树", "动态规划"]
+category: "algorithm"
+order: 1
+---
+
+## 高频面试题
+
+### 1. 数组去重
+
+```javascript
+// 方法1: Set（推荐）
+const unique = (arr) => [...new Set(arr)];
+
+// 方法2: filter + indexOf
+const unique2 = (arr) =>
+  arr.filter((item, index) => arr.indexOf(item) === index);
+
+// 方法3: Map（保留最后出现的值）
+const unique3 = (arr) => [...new Map(arr.map((v) => [v, v])).values()];
+```
+
+### 2. 数组扁平化
+
+```javascript
+// 方法1: Array.flat
+const flatten = (arr) => arr.flat(Infinity);
+
+// 方法2: 递归 reduce
+function flatten2(arr) {
+  return arr.reduce(
+    (acc, cur) =>
+      Array.isArray(cur) ? [...acc, ...flatten2(cur)] : [...acc, cur],
+    []
+  );
+}
+
+// 方法3: 迭代（栈，性能更好）
+function flatten3(arr) {
+  const stack = [...arr];
+  const result = [];
+  while (stack.length) {
+    const item = stack.pop();
+    if (Array.isArray(item)) {
+      stack.push(...item);
+    } else {
+      result.unshift(item);
+    }
+  }
+  return result;
+}
+```
+
+### 3. 二叉树遍历
+
+```javascript
+// 层序遍历（BFS）- 最常考
+function levelOrder(root) {
+  if (!root) return [];
+  const result = [];
+  const queue = [root];
+
+  while (queue.length) {
+    const level = [];
+    const size = queue.length;
+    for (let i = 0; i < size; i++) {
+      const node = queue.shift();
+      level.push(node.val);
+      if (node.left) queue.push(node.left);
+      if (node.right) queue.push(node.right);
+    }
+    result.push(level);
+  }
+  return result;
+}
+
+// 前序遍历（迭代）
+function preorder(root) {
+  const result = [];
+  const stack = [root];
+  while (stack.length) {
+    const node = stack.pop();
+    if (!node) continue;
+    result.push(node.val);
+    stack.push(node.right);
+    stack.push(node.left);
+  }
+  return result;
+}
+```
+
+### 4. 快速排序
+
+```javascript
+function quickSort(arr) {
+  if (arr.length <= 1) return arr;
+  const pivot = arr[Math.floor(arr.length / 2)];
+  const left = arr.filter((x) => x < pivot);
+  const mid = arr.filter((x) => x === pivot);
+  const right = arr.filter((x) => x > pivot);
+  return [...quickSort(left), ...mid, ...quickSort(right)];
+}
+```
+
+### 5. LRU 缓存（高频考题）
+
+```javascript
+class LRUCache {
+  constructor(capacity) {
+    this.capacity = capacity;
+    this.cache = new Map(); // Map 保持插入顺序
+  }
+
+  get(key) {
+    if (!this.cache.has(key)) return -1;
+    const value = this.cache.get(key);
+    this.cache.delete(key);
+    this.cache.set(key, value); // 移到最末（最近使用）
+    return value;
+  }
+
+  put(key, value) {
+    if (this.cache.has(key)) this.cache.delete(key);
+    else if (this.cache.size >= this.capacity) {
+      // 删除最久未使用的（Map 中第一个）
+      this.cache.delete(this.cache.keys().next().value);
+    }
+    this.cache.set(key, value);
+  }
+}
+```
+
+### 6. 动态规划：最长递增子序列
+
+```javascript
+function lengthOfLIS(nums) {
+  const dp = new Array(nums.length).fill(1);
+  let maxLen = 1;
+
+  for (let i = 1; i < nums.length; i++) {
+    for (let j = 0; j < i; j++) {
+      if (nums[j] < nums[i]) {
+        dp[i] = Math.max(dp[i], dp[j] + 1);
+      }
+    }
+    maxLen = Math.max(maxLen, dp[i]);
+  }
+  return maxLen;
+}
+// 时间复杂度 O(n²)，可用二分优化到 O(n log n)
+```
+
+## 深入追问
+
+### 时间复杂度总结
+
+| 算法 | 平均 | 最坏 | 空间 |
+|------|------|------|------|
+| 快速排序 | O(n log n) | O(n²) | O(log n) |
+| 归并排序 | O(n log n) | O(n log n) | O(n) |
+| 堆排序 | O(n log n) | O(n log n) | O(1) |
+| 二分查找 | O(log n) | O(log n) | O(1) |
+| BFS/DFS | O(V+E) | O(V+E) | O(V) |

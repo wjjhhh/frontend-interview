@@ -1,0 +1,94 @@
+---
+title: "Vite 原理与构建优化"
+description: "Vite 核心原理、HMR 机制、Rollup 插件、性能优化策略"
+difficulty: "高级"
+tags: ["Vite", "ESM", "HMR", "Rollup", "构建优化"]
+category: "engineering"
+order: 1
+---
+
+## 核心概念
+
+Vite 是新一代前端构建工具，开发环境基于原生 ESM，生产环境使用 Rollup 打包。
+
+### Vite vs Webpack
+
+| 特性 | Vite | Webpack |
+|------|------|---------|
+| 开发启动 | 即时启动（按需编译） | 全量打包 |
+| HMR 速度 | O(1) 与模块数无关 | O(n) 随模块增多变慢 |
+| 构建工具 | Rollup | 自有 |
+| 模块格式 | ESM | CommonJS/ESM |
+
+## 高频面试题
+
+### 1. Vite 为什么快？
+
+**开发环境：**
+- 利用浏览器原生 ESM，无需打包
+- 按需编译：只编译当前请求的模块
+- 预构建（esbuild）：将 CommonJS/UMD 转为 ESM，合并小模块
+
+```javascript
+// 浏览器直接请求模块
+import { createApp } from '/node_modules/.vite/deps/vue.js'
+import App from '/src/App.vue?t=1234567890'
+```
+
+**生产环境：**
+- 使用 Rollup 打包（Tree Shaking 更好）
+- 代码分割和动态导入
+
+### 2. HMR（热模块替换）原理
+
+```javascript
+// Vite HMR API
+if (import.meta.hot) {
+  import.meta.hot.accept('./module.js', (newModule) => {
+    // 模块更新后的处理
+  });
+
+  import.meta.hot.dispose(() => {
+    // 清理副作用
+  });
+}
+```
+
+Vite HMR 流程：
+1. 文件变更 → Vite Server 检测
+2. 计算 HMR 边界（最近的 `accept` 模块）
+3. WebSocket 通知浏览器
+4. 浏览器重新请求变更模块
+5. 执行更新回调
+
+### 3. 依赖预构建
+
+Vite 使用 esbuild 对 `node_modules` 进行预构建：
+
+- 将 CommonJS/UMD 转为 ESM
+- 合并众多小文件（如 lodash-es 有 600+ 模块）
+- 缓存到 `node_modules/.vite`
+
+## 深入追问
+
+### Tree Shaking 的原理
+
+Tree Shaking 基于 ESM 的静态结构分析：
+- `import/export` 是静态声明，编译时可确定依赖关系
+- 标记未使用的导出
+- 压缩阶段删除未引用代码
+- `sideEffects: false` 告诉打包器模块无副作用
+
+### Rollup 插件机制
+
+```javascript
+// Vite 插件示例
+export default function myPlugin() {
+  return {
+    name: 'my-plugin',
+    resolveId(source) { /* 解析模块路径 */ },
+    load(id) { /* 加载模块内容 */ },
+    transform(code, id) { /* 转换模块代码 */ },
+  };
+}
+```

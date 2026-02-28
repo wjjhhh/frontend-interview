@@ -1,0 +1,102 @@
+---
+title: "HTTP 协议与网络安全"
+description: "HTTP/1.1、HTTP/2、HTTP/3 演进，HTTPS 原理，常见安全攻防"
+difficulty: "中级"
+tags: ["HTTP", "HTTPS", "HTTP/2", "安全", "XSS", "CSRF"]
+category: "network"
+order: 1
+---
+
+## 核心概念
+
+### HTTP 协议演进
+
+- **HTTP/1.1**：持久连接、管道化、分块传输
+- **HTTP/2**：多路复用、头部压缩（HPACK）、服务端推送、二进制帧
+- **HTTP/3**：基于 QUIC（UDP）、0-RTT 连接、无队头阻塞
+
+## 高频面试题
+
+### 1. HTTP 缓存机制
+
+```
+强缓存（不发请求）：
+  Cache-Control: max-age=31536000
+  Expires: Thu, 01 Jan 2030 00:00:00 GMT
+
+协商缓存（发请求验证）：
+  ETag / If-None-Match（精确，哈希值）
+  Last-Modified / If-Modified-Since（秒级精度）
+```
+
+**缓存策略建议：**
+- HTML：`no-cache`（每次协商验证）
+- CSS/JS（带hash）：`max-age=31536000`（长期缓存）
+- API 数据：`no-store` 或短时间 `max-age`
+
+### 2. HTTPS 握手过程（TLS 1.3）
+
+1. Client Hello：支持的 TLS 版本、加密套件、随机数 + 密钥共享
+2. Server Hello：选择的加密套件、证书、随机数 + 密钥共享
+3. 客户端验证证书（CA 链）
+4. 双方通过 ECDHE 算法生成共享密钥
+5. 使用对称加密进行后续通信
+
+TLS 1.3 优势：1-RTT 握手（比 TLS 1.2 少一次往返），支持 0-RTT 会话恢复。
+
+### 3. 跨域解决方案
+
+```javascript
+// CORS 服务端响应头
+Access-Control-Allow-Origin: https://example.com
+Access-Control-Allow-Methods: GET, POST, PUT
+Access-Control-Allow-Headers: Content-Type, Authorization
+Access-Control-Allow-Credentials: true
+// 预检请求缓存
+Access-Control-Max-Age: 86400
+```
+
+```javascript
+// Vite 开发代理
+server: {
+  proxy: {
+    '/api': {
+      target: 'http://backend:3000',
+      changeOrigin: true,
+      rewrite: (path) => path.replace(/^\/api/, ''),
+    },
+  },
+}
+```
+
+### 4. XSS 与 CSRF 防御
+
+**XSS（跨站脚本攻击）防御：**
+
+```javascript
+// 输出转义
+function escapeHTML(str) {
+  return str.replace(/[&<>"']/g, (char) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;',
+    '"': '&quot;', "'": '&#x27;',
+  }[char]));
+}
+
+// CSP 响应头
+Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-{random}'
+```
+
+**CSRF 防御：**
+- CSRF Token：请求头携带随机令牌
+- SameSite Cookie：`SameSite=Strict` 或 `SameSite=Lax`
+- 验证 Origin/Referer 请求头
+
+## 深入追问
+
+### HTTP/2 多路复用如何解决队头阻塞？
+
+HTTP/1.1 的队头阻塞：同一连接上的请求必须按顺序响应。
+
+HTTP/2 解决方案：引入「流」（Stream）概念，每个请求/响应是独立的流，通过帧（Frame）交错传输，互不阻塞。
+
+但 HTTP/2 仍有 TCP 层队头阻塞：一个 TCP 包丢失会阻塞所有流。HTTP/3 用 QUIC（UDP）彻底解决。

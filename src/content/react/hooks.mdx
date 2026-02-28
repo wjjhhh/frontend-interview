@@ -1,0 +1,134 @@
+---
+title: "React Hooks 原理与最佳实践"
+description: "useState/useEffect 实现原理、自定义 Hooks、常见陷阱"
+difficulty: "高级"
+tags: ["Hooks", "useState", "useEffect", "自定义Hook"]
+category: "react"
+order: 1
+---
+
+## 核心概念
+
+React Hooks 是 React 16.8 引入的特性，让函数组件也能使用状态和生命周期。Hooks 的底层基于**链表结构**，每个组件维护一个 Hooks 链表。
+
+### Hooks 规则
+
+1. 只在函数组件或自定义 Hook 的顶层调用
+2. 不要在循环、条件或嵌套函数中调用
+
+这是因为 React 依赖 Hooks 的调用顺序来确定每个 Hook 对应的状态。
+
+## 高频面试题
+
+### 1. useState 的实现原理
+
+```javascript
+// 简化版 useState 实现
+let state = [];
+let stateIndex = 0;
+
+function useState(initialValue) {
+  const currentIndex = stateIndex;
+  state[currentIndex] = state[currentIndex] ?? initialValue;
+
+  const setState = (newValue) => {
+    if (typeof newValue === 'function') {
+      state[currentIndex] = newValue(state[currentIndex]);
+    } else {
+      state[currentIndex] = newValue;
+    }
+    render(); // 触发重渲染
+  };
+
+  stateIndex++;
+  return [state[currentIndex], setState];
+}
+```
+
+### 2. useEffect 的执行时机
+
+- `useEffect(() => {})` — 每次渲染后执行
+- `useEffect(() => {}, [])` — 仅挂载后执行一次
+- `useEffect(() => {}, [dep])` — dep 变化时执行
+- 清理函数在**下次 effect 执行前**或**组件卸载时**调用
+
+```javascript
+useEffect(() => {
+  const handler = () => console.log('resize');
+  window.addEventListener('resize', handler);
+  return () => window.removeEventListener('resize', handler);
+}, []);
+```
+
+### 3. useRef vs useState
+
+- `useRef` 不触发重渲染，`.current` 是可变引用
+- `useState` 触发重渲染，值是不可变快照
+
+```javascript
+function Timer() {
+  const countRef = useRef(0);
+  const [count, setCount] = useState(0);
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      countRef.current += 1;
+      setCount(countRef.current);
+    }, 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  return <span>{count}</span>;
+}
+```
+
+## 深入追问
+
+### React.memo、useMemo、useCallback 的区别
+
+- **React.memo**: 高阶组件，对 props 浅比较决定是否跳过渲染
+- **useMemo**: 缓存计算结果，依赖变化才重算
+- **useCallback**: 缓存函数引用，本质是 `useMemo(() => fn, deps)`
+
+### 闭包陷阱与解决方案
+
+```javascript
+// 问题：count 始终为 0
+function Counter() {
+  const [count, setCount] = useState(0);
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      setCount(count + 1); // 闭包捕获旧值
+    }, 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // 解决方案：使用函数式更新
+  useEffect(() => {
+    const id = setInterval(() => {
+      setCount((prev) => prev + 1);
+    }, 1000);
+    return () => clearInterval(id);
+  }, []);
+}
+```
+
+## 手写练习
+
+> 实现一个 `useDebounce` 自定义 Hook：
+
+```javascript
+function useDebounce(value, delay) {
+  const [debouncedValue, setDebouncedValue] = useState(value);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedValue(value);
+    }, delay);
+    return () => clearTimeout(timer);
+  }, [value, delay]);
+
+  return debouncedValue;
+}
+```

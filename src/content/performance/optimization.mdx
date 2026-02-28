@@ -1,0 +1,131 @@
+---
+title: "前端性能优化全面指南"
+description: "首屏优化、资源加载、渲染优化、Web Vitals 核心指标"
+difficulty: "高级"
+tags: ["性能优化", "Web Vitals", "首屏", "懒加载"]
+category: "performance"
+order: 1
+---
+
+## 核心概念
+
+### Web Vitals 核心指标
+
+- **LCP（Largest Contentful Paint）**：最大内容绘制，< 2.5s
+- **INP（Interaction to Next Paint）**：交互到下一次绘制，< 200ms
+- **CLS（Cumulative Layout Shift）**：累积布局偏移，< 0.1
+
+## 高频面试题
+
+### 1. 首屏优化策略
+
+**资源层面：**
+- 代码分割 + 路由懒加载
+- Tree Shaking 移除无用代码
+- 图片优化（WebP/AVIF、响应式图片、懒加载）
+- 字体优化（font-display: swap、子集化）
+
+**网络层面：**
+- CDN 分发静态资源
+- HTTP/2 多路复用
+- 预加载关键资源（link rel="preload"）
+- Service Worker 缓存
+
+**渲染层面：**
+- SSR/SSG 服务端渲染
+- 骨架屏 + Loading 状态
+- 关键 CSS 内联
+- 延迟非关键 JS
+
+### 2. 虚拟列表实现原理
+
+当列表数据量很大时（10000+条），只渲染可视区域的元素：
+
+```javascript
+function VirtualList({ items, itemHeight, containerHeight }) {
+  const [scrollTop, setScrollTop] = useState(0);
+  const startIndex = Math.floor(scrollTop / itemHeight);
+  const endIndex = Math.min(
+    startIndex + Math.ceil(containerHeight / itemHeight) + 1,
+    items.length
+  );
+  const visibleItems = items.slice(startIndex, endIndex);
+  const totalHeight = items.length * itemHeight;
+
+  return (
+    <div
+      style={{ height: containerHeight, overflow: 'auto' }}
+      onScroll={(e) => setScrollTop(e.target.scrollTop)}
+    >
+      <div style={{ height: totalHeight, position: 'relative' }}>
+        {visibleItems.map((item, i) => (
+          <div
+            key={startIndex + i}
+            style={{
+              position: 'absolute',
+              top: (startIndex + i) * itemHeight,
+              height: itemHeight,
+            }}
+          >
+            {item}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+### 3. 防抖与节流
+
+```javascript
+// 防抖：延迟执行，连续触发只执行最后一次
+function debounce(fn, delay) {
+  let timer = null;
+  return function (...args) {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn.apply(this, args), delay);
+  };
+}
+
+// 节流：固定时间内只执行一次
+function throttle(fn, interval) {
+  let lastTime = 0;
+  return function (...args) {
+    const now = Date.now();
+    if (now - lastTime >= interval) {
+      lastTime = now;
+      fn.apply(this, args);
+    }
+  };
+}
+```
+
+## 深入追问
+
+### 如何排查性能瓶颈？
+
+1. **Lighthouse** 报告整体评分
+2. **Performance** 面板分析运行时性能
+3. **Coverage** 面板查找未使用代码
+4. **Network** 面板分析资源加载瀑布流
+5. **Web Vitals** 插件监控核心指标
+
+### 图片懒加载实现
+
+```javascript
+// 使用 Intersection Observer API
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach((entry) => {
+    if (entry.isIntersecting) {
+      const img = entry.target;
+      img.src = img.dataset.src;
+      observer.unobserve(img);
+    }
+  });
+});
+
+document.querySelectorAll('img[data-src]').forEach((img) => {
+  observer.observe(img);
+});
+```

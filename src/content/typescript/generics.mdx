@@ -1,0 +1,119 @@
+---
+title: "TypeScript 泛型与类型体操"
+description: "泛型基础、条件类型、映射类型、infer 关键字实战"
+difficulty: "高级"
+tags: ["泛型", "类型体操", "条件类型", "infer"]
+category: "typescript"
+order: 1
+---
+
+## 核心概念
+
+泛型（Generics）是 TypeScript 中实现类型复用的核心机制，允许在定义函数、接口或类时使用类型参数。
+
+### 基本语法
+
+```typescript
+function identity<T>(arg: T): T {
+  return arg;
+}
+
+interface Container<T> {
+  value: T;
+  getValue: () => T;
+}
+```
+
+## 高频面试题
+
+### 1. 常见内置工具类型实现
+
+```typescript
+// Partial<T> - 所有属性变为可选
+type MyPartial<T> = {
+  [K in keyof T]?: T[K];
+};
+
+// Required<T> - 所有属性变为必选
+type MyRequired<T> = {
+  [K in keyof T]-?: T[K];
+};
+
+// Pick<T, K> - 选取指定属性
+type MyPick<T, K extends keyof T> = {
+  [P in K]: T[P];
+};
+
+// Omit<T, K> - 排除指定属性
+type MyOmit<T, K extends keyof T> = {
+  [P in keyof T as P extends K ? never : P]: T[P];
+};
+```
+
+### 2. 条件类型与 infer
+
+```typescript
+// 提取函数返回类型
+type MyReturnType<T> = T extends (...args: any[]) => infer R ? R : never;
+
+// 提取 Promise 解析类型
+type UnwrapPromise<T> = T extends Promise<infer U> ? UnwrapPromise<U> : T;
+
+// 提取数组元素类型
+type ElementType<T> = T extends (infer U)[] ? U : T;
+```
+
+### 3. 模板字面量类型
+
+```typescript
+type EventName<T extends string> = `on${Capitalize<T>}`;
+type ClickEvent = EventName<'click'>; // 'onClick'
+
+// 深层路径类型
+type DeepKeys<T> = T extends object
+  ? {
+      [K in keyof T & string]: T[K] extends object
+        ? K | `${K}.${DeepKeys<T[K]>}`
+        : K;
+    }[keyof T & string]
+  : never;
+```
+
+## 深入追问
+
+### 协变与逆变
+
+- **协变（Covariant）**：子类型可以赋值给父类型（数组、函数返回值）
+- **逆变（Contravariant）**：父类型可以赋值给子类型（函数参数在 strict 模式下）
+
+```typescript
+type Animal = { name: string };
+type Dog = { name: string; bark: () => void };
+
+// 协变：Dog extends Animal
+type Covariant<T> = () => T;
+type A = Covariant<Dog> extends Covariant<Animal> ? true : false; // true
+
+// 逆变：参数位置
+type Contravariant<T> = (arg: T) => void;
+type B = Contravariant<Animal> extends Contravariant<Dog> ? true : false; // true
+```
+
+### never 和 unknown 的区别
+
+- `never`：底部类型，不可达，是所有类型的子类型
+- `unknown`：顶部类型，所有类型的父类型，比 `any` 更安全
+
+## 手写练习
+
+> 实现 `DeepReadonly<T>` 类型：
+
+```typescript
+type DeepReadonly<T> = {
+  readonly [K in keyof T]: T[K] extends object
+    ? T[K] extends Function
+      ? T[K]
+      : DeepReadonly<T[K]>
+    : T[K];
+};
+```
