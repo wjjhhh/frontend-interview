@@ -20,6 +20,8 @@ const categories = [
   { slug: "network", name: "网络与安全" },
   { slug: "browser", name: "浏览器原理" },
   { slug: "algorithm", name: "算法与系统设计" },
+  { slug: "nextjs", name: "Next.js" },
+  { slug: "web3", name: "Web3 开发" },
 ];
 
 export function MobileNav({ onOpenSearch }: { onOpenSearch: () => void }) {

@@ -1,0 +1,394 @@
+---
+title: "Webpack 核心原理深度解析"
+description: "构建流程、Loader/Plugin 原理、Tapable 钩子、Tree Shaking、代码分割、Module Federation"
+difficulty: "高级"
+tags: ["Webpack", "Loader", "Plugin", "Tapable", "Tree Shaking", "代码分割", "Module Federation"]
+category: "engineering"
+order: 2
+---
+
+## Webpack 构建全流程
+
+```text
+webpack(config)
+      │
+      ▼
+① 初始化阶段
+   读取配置 → 创建 Compiler 对象 → 注册所有 Plugin
+      │
+      ▼
+② 构建阶段（Make）
+   从 entry 开始
+   → ModuleFactory.create()  创建模块
+   → Loader 链处理源文件    （loader-runner）
+   → Parser 解析 AST
+   → 分析 import/require，递归构建模块依赖图
+      │
+      ▼
+③ 封装阶段（Seal）
+   将模块分配到 Chunk
+   → ChunkGroup 计算
+   → 代码分割（splitChunks）
+   → 生成最终 bundle 代码
+      │
+      ▼
+④ 输出阶段（Emit）
+   将 Chunk 写入文件系统（dist/）
+```
+
+## 高频面试题
+
+### 1. Loader vs Plugin：本质区别
+
+```text
+Loader                              Plugin
+──────────────────────────          ──────────────────────────────
+处理单个文件的内容转换              监听整个构建生命周期的事件钩子
+输入文件内容，输出 JS 字符串        可以做任何 Loader 做不到的事
+在 Module 构建阶段执行              贯穿整个 Webpack 生命周期
+链式：从右到左依次执行              基于 Tapable 发布订阅
+示例：sass → css → style           示例：HtmlWebpackPlugin、MiniCssExtractPlugin
+```
+
+### 2. Loader 原理与手写
+
+Loader 是一个函数，接收源代码，返回转换后的代码：
+
+```javascript
+// my-markdown-loader.js
+const marked = require('marked');
+
+// 普通 loader（同步）
+module.exports = function (source) {
+  // this 是 loaderContext，提供各种 API
+  const html = marked(source);
+  // 返回值必须是 JS 字符串（或 Buffer）
+  return `module.exports = ${JSON.stringify(html)}`;
+};
+
+// 异步 loader
+module.exports = async function (source) {
+  const callback = this.async(); // 声明异步
+  try {
+    const result = await someAsyncTransform(source);
+    callback(null, result);       // (error, code, sourceMap, meta)
+  } catch (err) {
+    callback(err);
+  }
+};
+
+// 带 options 的 loader
+module.exports = function (source) {
+  const options = this.getOptions({
+    // JSON Schema 校验 options
+    type: 'object',
+    properties: {
+      minify: { type: 'boolean' },
+    },
+  });
+
+  if (options.minify) {
+    source = minify(source);
+  }
+
+  return source;
+};
+
+// pitch loader（从左到右执行，可拦截后续 loader）
+module.exports.pitch = function (remainingRequest, precedingRequest, data) {
+  // 如果 pitch 有返回值，跳过后续 loader，直接进入剩余 pitch 的 normal 阶段
+  // 用途：style-loader 用 pitch 将 CSS 内联注入，不需要等 css-loader 处理
+};
+```
+
+**Loader 执行顺序：**
+
+```text
+rules: [
+  { test: /\.scss$/, use: ['style-loader', 'css-loader', 'sass-loader'] }
+]
+
+执行顺序（从右到左，从下到上）：
+  .scss 文件
+    → sass-loader   (SCSS → CSS)
+    → css-loader    (CSS → JS 模块，处理 @import/url)
+    → style-loader  (JS → <style> 注入 DOM)
+
+pitch 阶段（从左到右）：
+  style-loader.pitch → css-loader.pitch → sass-loader.pitch
+normal 阶段（从右到左）：
+  sass-loader → css-loader → style-loader
+```
+
+### 3. Plugin 原理：Tapable 钩子系统
+
+Webpack 内部用 **Tapable** 实现发布订阅，Plugin 通过 `apply` 方法注册钩子监听：
+
+```javascript
+// Tapable 钩子类型
+const { SyncHook, AsyncSeriesHook, SyncBailHook, AsyncParallelHook } = require('tapable');
+
+// SyncHook：同步串行，无法中断
+const syncHook = new SyncHook(['arg1', 'arg2']);
+syncHook.tap('pluginA', (a, b) => console.log(a, b));
+syncHook.call('hello', 'world'); // 触发
+
+// SyncBailHook：同步串行，返回非 undefined 则中断
+const bailHook = new SyncBailHook(['options']);
+bailHook.tap('validate', (opts) => {
+  if (!opts.entry) return new Error('entry is required'); // 中断
+});
+
+// AsyncSeriesHook：异步串行（等上一个完成才执行下一个）
+const asyncHook = new AsyncSeriesHook(['compiler']);
+asyncHook.tapAsync('PluginA', (compiler, callback) => {
+  setTimeout(() => callback(), 1000); // 完成后调用 callback
+});
+asyncHook.tapPromise('PluginB', (compiler) => {
+  return someAsyncWork(); // 返回 Promise
+});
+
+// AsyncParallelHook：异步并行（同时执行所有）
+```
+
+**手写一个 Plugin：**
+
+```javascript
+// BannerPlugin：给每个输出文件头部添加注释
+class BannerPlugin {
+  constructor(options) {
+    this.banner = options.banner;
+  }
+
+  apply(compiler) {
+    // compiler.hooks.emit：生成资源到 output 目录之前触发
+    compiler.hooks.emit.tapAsync('BannerPlugin', (compilation, callback) => {
+      // compilation 包含本次构建的所有资源
+      for (const filename in compilation.assets) {
+        if (filename.endsWith('.js')) {
+          const original = compilation.assets[filename];
+          const source = `/* ${this.banner} */\n${original.source()}`;
+
+          // 替换资源内容
+          compilation.assets[filename] = {
+            source: () => source,
+            size: () => source.length,
+          };
+        }
+      }
+      callback();
+    });
+  }
+}
+
+// webpack.config.js
+module.exports = {
+  plugins: [
+    new BannerPlugin({ banner: 'Build time: ' + new Date().toISOString() }),
+  ],
+};
+```
+
+### 4. 重要的生命周期钩子
+
+```javascript
+// Compiler 钩子（整个 Webpack 生命周期）
+compiler.hooks.initialize         // 初始化
+compiler.hooks.beforeRun          // run() 之前
+compiler.hooks.run                // 开始读取 records
+compiler.hooks.beforeCompile      // compilation 参数创建前
+compiler.hooks.compile            // 一次新的编译创建
+compiler.hooks.make               // 从 entry 开始构建（最重要）
+compiler.hooks.afterCompile       // 构建完成
+compiler.hooks.emit               // 输出到 output 目录之前 ⭐
+compiler.hooks.afterEmit          // 输出之后
+compiler.hooks.done               // 完成（包含 stats 信息）
+compiler.hooks.watchRun           // watch 模式下文件变更触发
+
+// Compilation 钩子（单次构建的详细流程）
+compilation.hooks.buildModule     // 模块开始构建
+compilation.hooks.succeedModule   // 模块构建成功
+compilation.hooks.finishModules   // 所有模块构建完成
+compilation.hooks.seal            // 封装阶段开始
+compilation.hooks.optimizeChunks  // 优化 chunks（SplitChunksPlugin 在此执行）
+compilation.hooks.afterSeal       // 封装阶段完成
+```
+
+### 5. Tree Shaking 与 SideEffects
+
+```javascript
+// webpack.config.js：开启优化
+module.exports = {
+  mode: 'production', // 自动开启 Tree Shaking + 代码压缩
+  optimization: {
+    usedExports: true,   // 标记未使用的导出
+    minimize: true,      // 开启压缩（删除标记的代码）
+    sideEffects: true,   // 读取 package.json 的 sideEffects 字段
+  },
+};
+
+// Tree Shaking 失效的常见原因：
+// ① 使用 CommonJS（require/module.exports）
+// ② Babel 将 ESM 转为 CJS（旧版 @babel/preset-env 默认行为）
+//    解决：设置 modules: false
+//    { "presets": [["@babel/preset-env", { "modules": false }]] }
+// ③ 函数有副作用但未标记
+//    解决：package.json 加 "sideEffects": ["*.css"]
+// ④ 动态属性访问（obj[key]）无法静态分析
+```
+
+### 6. 代码分割（Code Splitting）
+
+```javascript
+// 方式1：entry 多入口（手动分割）
+module.exports = {
+  entry: {
+    app: './src/index.js',
+    admin: './src/admin.js',
+  },
+};
+
+// 方式2：动态 import（按需加载）
+// 触发 Webpack 自动分割出新 chunk
+async function loadPage(page) {
+  if (page === 'dashboard') {
+    const { Dashboard } = await import(
+      /* webpackChunkName: "dashboard" */   // 指定 chunk 名称
+      /* webpackPrefetch: true */           // 浏览器空闲时预获取
+      './pages/Dashboard'
+    );
+    return Dashboard;
+  }
+}
+
+// 方式3：SplitChunksPlugin（自动分割公共模块）
+module.exports = {
+  optimization: {
+    splitChunks: {
+      chunks: 'all',              // 'async'（默认）| 'initial' | 'all'
+      minSize: 20000,             // chunk 最小 20KB 才分割
+      minChunks: 1,               // 被引用至少1次才分割
+      maxAsyncRequests: 30,       // 异步加载最多并行请求数
+      cacheGroups: {
+        // 将 node_modules 打成单独 vendor chunk
+        vendors: {
+          test: /[\\/]node_modules[\\/]/,
+          name: 'vendors',
+          priority: -10,          // 优先级（越大越优先）
+          chunks: 'all',
+        },
+        // 被多处引用的公共模块
+        common: {
+          minChunks: 2,           // 至少被 2 个 chunk 引用
+          name: 'common',
+          priority: -20,
+          reuseExistingChunk: true,
+        },
+      },
+    },
+    // 将 runtime 代码单独提取（避免 vendor hash 因运行时代码变化而改变）
+    runtimeChunk: 'single',
+  },
+};
+```
+
+### 7. Module Federation（模块联邦）
+
+Module Federation 是 Webpack 5 实现**微前端**的核心特性，允许多个构建产物在运行时共享模块：
+
+```javascript
+// 应用A（Host）：消费远程模块
+// webpack.config.js
+const { ModuleFederationPlugin } = require('webpack').container;
+
+module.exports = {
+  plugins: [
+    new ModuleFederationPlugin({
+      name: 'host',
+      remotes: {
+        // 声明要消费的远程应用
+        shop: 'shop@https://shop.example.com/remoteEntry.js',
+        cart: 'cart@https://cart.example.com/remoteEntry.js',
+      },
+      shared: {
+        react: { singleton: true, requiredVersion: '^18.0.0' },
+        'react-dom': { singleton: true },
+      },
+    }),
+  ],
+};
+
+// 在 Host 中使用远程模块（懒加载）
+const ProductList = React.lazy(() => import('shop/ProductList'));
+const CartIcon = React.lazy(() => import('cart/CartIcon'));
+
+// 应用B（Remote）：暴露模块
+module.exports = {
+  plugins: [
+    new ModuleFederationPlugin({
+      name: 'shop',
+      filename: 'remoteEntry.js', // 入口文件（供 Host 加载）
+      exposes: {
+        './ProductList': './src/components/ProductList',
+        './useCart': './src/hooks/useCart',
+      },
+      shared: {
+        react: { singleton: true },
+      },
+    }),
+  ],
+};
+```
+
+```text
+运行时工作原理：
+  Host 页面加载
+    → 遇到 import('shop/ProductList')
+    → 动态加载 https://shop.example.com/remoteEntry.js
+    → remoteEntry.js 注册 shop 的 scope 和 module map
+    → 按需加载 ProductList 对应的 chunk
+    → 执行渲染
+
+共享依赖（shared）：
+  Host 和 Remote 都依赖 React
+  shared: { react: { singleton: true } }
+  → 运行时协商：只使用一份 React（版本满足要求时）
+  → 避免页面上出现两份 React 实例（会导致 Hooks 报错）
+```
+
+## 深入追问
+
+### Webpack 热更新（HMR）原理
+
+```text
+1. Webpack 监听文件变化（chokidar）
+2. 重新编译变更的模块，生成新的 hash
+3. 通过 WebSocket 推送 { type: 'hash', hash: 'xxxxx' }
+4. HMR Client 收到后，发起请求获取更新清单：
+   GET /__webpack_hmr?hash=xxxxx → 返回 { c: ['chunkId'], m: ['moduleId'] }
+5. 再次请求新 chunk：GET /main.xxxxx.hot-update.js
+6. 执行 hot-update.js，替换模块（module.hot.accept 的回调）
+7. 若模块链上没有 accept，则页面强制刷新
+
+关键：Webpack HMR 的粒度是 chunk，Vite 的粒度是单个模块文件
+```
+
+### Webpack 5 持久化缓存
+
+```javascript
+// webpack.config.js
+module.exports = {
+  cache: {
+    type: 'filesystem',           // 持久化缓存（存到磁盘）
+    buildDependencies: {
+      config: [__filename],       // config 变化时使缓存失效
+    },
+    cacheDirectory: '.webpack_cache', // 缓存目录
+    compression: 'gzip',          // 压缩缓存文件
+  },
+};
+
+// 原理：将模块解析结果、编译结果序列化到磁盘
+// 二次构建时跳过未变化的模块，只重新处理变更部分
+// 大型项目可将构建时间从 60s → 5s
+```

@@ -16,6 +16,11 @@ const defaultCategoryMeta: Record<string, CategoryMeta> = {
   network: { name: "网络与安全", description: "HTTP/2/3、HTTPS、跨域、XSS/CSRF", icon: "globe", order: 8 },
   browser: { name: "浏览器原理", description: "渲染流程、V8引擎、内存管理、Web API", icon: "monitor", order: 9 },
   algorithm: { name: "算法与系统设计", description: "常见算法题、前端系统设计", icon: "binary", order: 10 },
+  nextjs: { name: "Next.js", description: "App Router、缓存体系、渲染策略、Server Actions、性能优化", icon: "triangle", order: 11 },
+  "micro-frontend": { name: "微前端", description: "Module Federation、qiankun/single-spa、沙箱隔离、应用通信", icon: "layers", order: 12 },
+  miniprogram: { name: "小程序", description: "双线程模型、生命周期、setData优化、分包加载、跨端框架", icon: "smartphone", order: 13 },
+  "ai-agent": { name: "AI Agent", description: "LLM集成、流式响应、Tool Calling、RAG、Prompt工程、MCP协议", icon: "bot", order: 14 },
+  web3: { name: "Web3 开发", description: "区块链基础、钱包连接、ethers.js/viem、wagmi、智能合约交互", icon: "link", order: 15 },
 };
 
 export function getCategories(): CategoryInfo[] {

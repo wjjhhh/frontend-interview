@@ -1,0 +1,467 @@
+---
+title: "DApp 开发实战：ethers.js、viem 与 wagmi"
+description: "钱包连接、智能合约交互、ERC-20/721、EIP-712 签名、wagmi Hooks、常见错误处理"
+difficulty: "高级"
+tags: ["ethers.js", "viem", "wagmi", "智能合约", "ERC-20", "EIP-712", "RainbowKit"]
+category: "web3"
+order: 2
+---
+
+## ethers.js vs viem：如何选择？
+
+```text
+ethers.js v6                         viem（更现代）
+───────────────────────              ───────────────────────────────
+最流行，文档丰富                      更小的包体积（tree-shakable）
+面向对象（Provider/Signer 类）        函数式 API，TypeScript 类型更强
+v5→v6 有 breaking changes            与 wagmi v2 深度集成
+适合：独立脚本、合约部署              适合：React DApp，wagmi 生态
+
+两者 API 概念相通，选一个熟练即可
+本节用 ethers.js v6，wagmi 部分用 viem
+```
+
+## 高频面试题
+
+### 1. 连接 MetaMask 钱包
+
+```typescript
+// 原生方式（底层 API）
+async function connectWallet() {
+  if (!window.ethereum) {
+    throw new Error('请安装 MetaMask');
+  }
+
+  // 请求用户授权（弹出 MetaMask 确认框）
+  const accounts: string[] = await window.ethereum.request({
+    method: 'eth_requestAccounts',
+  });
+  const address = accounts[0];
+
+  // 监听账户切换
+  window.ethereum.on('accountsChanged', (newAccounts: string[]) => {
+    if (newAccounts.length === 0) {
+      // 用户锁定或断开钱包
+      setAddress(null);
+    } else {
+      setAddress(newAccounts[0]);
+    }
+  });
+
+  // 监听链切换
+  window.ethereum.on('chainChanged', (chainId: string) => {
+    // 链切换后刷新页面（推荐做法）
+    window.location.reload();
+  });
+
+  return address;
+}
+
+// ethers.js 封装
+const provider = new ethers.BrowserProvider(window.ethereum);
+const signer = await provider.getSigner();
+console.log('已连接:', await signer.getAddress());
+```
+
+### 2. 与智能合约交互
+
+合约交互需要两样东西：**合约地址** + **ABI**（Application Binary Interface，描述合约接口的 JSON）：
+
+```typescript
+// ERC-20 Token ABI（只需要用到的函数）
+const ERC20_ABI = [
+  'function name() view returns (string)',
+  'function symbol() view returns (string)',
+  'function decimals() view returns (uint8)',
+  'function totalSupply() view returns (uint256)',
+  'function balanceOf(address owner) view returns (uint256)',
+  'function transfer(address to, uint256 amount) returns (bool)',
+  'function approve(address spender, uint256 amount) returns (bool)',
+  'function allowance(address owner, address spender) view returns (uint256)',
+  'event Transfer(address indexed from, address indexed to, uint256 value)',
+];
+
+const USDC_ADDRESS = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'; // 以太坊主网 USDC
+
+// 只读合约（provider）
+const contract = new ethers.Contract(USDC_ADDRESS, ERC20_ABI, provider);
+
+// 调用 view 函数（不消耗 Gas，不需要签名）
+const name = await contract.name();              // "USD Coin"
+const decimals = await contract.decimals();      // 6
+const totalSupply = await contract.totalSupply(); // bigint
+
+// USDC 是 6 位小数，格式化显示
+const balance = await contract.balanceOf(userAddress);
+console.log('余额:', ethers.formatUnits(balance, 6), 'USDC');
+
+// 写操作需要 signer（会弹出 MetaMask 确认）
+const contractWithSigner = new ethers.Contract(USDC_ADDRESS, ERC20_ABI, signer);
+
+const tx = await contractWithSigner.transfer(
+  recipientAddress,
+  ethers.parseUnits('10', 6)  // 10 USDC（6位小数）
+);
+console.log('交易 hash:', tx.hash);
+const receipt = await tx.wait();
+console.log('确认区块:', receipt.blockNumber);
+```
+
+### 3. 监听合约事件
+
+```typescript
+// 方式1：监听实时事件（WebSocket Provider）
+const wsProvider = new ethers.WebSocketProvider('wss://mainnet.infura.io/ws/v3/KEY');
+const contract = new ethers.Contract(USDC_ADDRESS, ERC20_ABI, wsProvider);
+
+// 监听 Transfer 事件
+contract.on('Transfer', (from, to, value, event) => {
+  console.log(`转账: ${from} → ${to}`);
+  console.log('金额:', ethers.formatUnits(value, 6), 'USDC');
+  console.log('区块:', event.log.blockNumber);
+});
+
+// 停止监听（清理）
+contract.removeAllListeners('Transfer');
+
+// 方式2：查询历史事件（过滤器）
+const filter = contract.filters.Transfer(
+  null,            // from: null = 任何地址
+  userAddress,     // to: 指定地址（查询收到的转账）
+);
+
+const events = await contract.queryFilter(filter, -10000); // 最近 1 万个区块
+events.forEach((event) => {
+  const [from, to, value] = event.args;
+  console.log(`收到 ${ethers.formatUnits(value, 6)} USDC from ${from}`);
+});
+```
+
+### 4. ERC-20 vs ERC-721（NFT）
+
+```typescript
+// ERC-721 NFT 合约交互
+const NFT_ABI = [
+  'function ownerOf(uint256 tokenId) view returns (address)',
+  'function tokenURI(uint256 tokenId) view returns (string)',
+  'function balanceOf(address owner) view returns (uint256)',
+  'function transferFrom(address from, address to, uint256 tokenId)',
+  'function safeTransferFrom(address from, address to, uint256 tokenId)',
+  'function approve(address to, uint256 tokenId)',
+  'function setApprovalForAll(address operator, bool approved)',
+  'event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)',
+];
+
+const nftContract = new ethers.Contract(NFT_CONTRACT_ADDRESS, NFT_ABI, provider);
+
+// 查询 NFT 所有者
+const owner = await nftContract.ownerOf(1234);
+
+// 获取元数据 URI（通常是 IPFS 链接）
+const tokenURI = await nftContract.tokenURI(1234);
+// "ipfs://QmXxx.../1234.json" 或 "https://api.example.com/tokens/1234"
+
+// 获取元数据（图片、属性等）
+const metadata = await fetch(tokenURI.replace('ipfs://', 'https://ipfs.io/ipfs/')).then(r => r.json());
+console.log('名称:', metadata.name);
+console.log('图片:', metadata.image);
+console.log('属性:', metadata.attributes);
+```
+
+```text
+ERC-20 vs ERC-721 对比：
+
+ERC-20（同质化 Token）           ERC-721（非同质化 NFT）
+─────────────────────            ──────────────────────
+单位可分（0.001 USDC）            每个 Token 有唯一 ID
+所有 Token 等价                   每个 Token 独一无二
+适合：货币、积分、票权             适合：数字艺术、域名、游戏道具
+balanceOf 返回余额数值            balanceOf 返回持有数量
+transfer(to, amount)              transferFrom(from, to, tokenId)
+```
+
+### 5. wagmi：React Hooks 封装
+
+wagmi 是基于 viem 的 React 状态管理库，提供一套 Hooks 处理钱包连接、合约交互：
+
+```typescript
+// 1. 配置 wagmi（在 App 根部）
+import { createConfig, WagmiProvider, http } from 'wagmi';
+import { mainnet, polygon, arbitrum } from 'wagmi/chains';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { injected, metaMask, walletConnect } from 'wagmi/connectors';
+
+const config = createConfig({
+  chains: [mainnet, polygon, arbitrum],
+  connectors: [
+    metaMask(),
+    walletConnect({ projectId: 'YOUR_WALLETCONNECT_PROJECT_ID' }),
+    injected(),   // 通用注入型钱包（MetaMask、Coinbase Wallet 等）
+  ],
+  transports: {
+    [mainnet.id]: http('https://mainnet.infura.io/v3/KEY'),
+    [polygon.id]: http('https://polygon-rpc.com'),
+    [arbitrum.id]: http(),
+  },
+});
+
+const queryClient = new QueryClient();
+
+function App() {
+  return (
+    <WagmiProvider config={config}>
+      <QueryClientProvider client={queryClient}>
+        <YourApp />
+      </QueryClientProvider>
+    </WagmiProvider>
+  );
+}
+```
+
+```typescript
+// 2. 常用 Hooks
+import {
+  useAccount, useConnect, useDisconnect,
+  useBalance, useReadContract, useWriteContract,
+  useWaitForTransactionReceipt, useChainId, useSwitchChain,
+} from 'wagmi';
+
+// 钱包连接状态
+function WalletButton() {
+  const { address, isConnected, chain } = useAccount();
+  const { connect, connectors, isPending } = useConnect();
+  const { disconnect } = useDisconnect();
+
+  if (isConnected) {
+    return (
+      <div>
+        <p>{address?.slice(0, 6)}...{address?.slice(-4)}</p>
+        <p>链: {chain?.name}</p>
+        <button onClick={() => disconnect()}>断开连接</button>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {connectors.map((connector) => (
+        <button key={connector.id} onClick={() => connect({ connector })} disabled={isPending}>
+          {connector.name}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// 读合约（useReadContract）
+function TokenBalance({ tokenAddress }: { tokenAddress: `0x${string}` }) {
+  const { address } = useAccount();
+
+  const { data: balance, isLoading } = useReadContract({
+    address: tokenAddress,
+    abi: ERC20_ABI,
+    functionName: 'balanceOf',
+    args: [address!],           // 合约函数参数
+    query: { enabled: !!address }, // address 存在才查询
+  });
+
+  if (isLoading) return <p>查询中...</p>;
+  return <p>余额: {balance ? ethers.formatUnits(balance, 18) : '0'}</p>;
+}
+
+// 写合约（useWriteContract）
+function TransferButton({ tokenAddress }: { tokenAddress: `0x${string}` }) {
+  const { writeContract, data: hash, isPending } = useWriteContract();
+  const { isLoading: isConfirming, isSuccess } = useWaitForTransactionReceipt({ hash });
+
+  function handleTransfer() {
+    writeContract({
+      address: tokenAddress,
+      abi: ERC20_ABI,
+      functionName: 'transfer',
+      args: ['0xRecipient...', ethers.parseUnits('10', 18)],
+    });
+  }
+
+  return (
+    <div>
+      <button onClick={handleTransfer} disabled={isPending || isConfirming}>
+        {isPending ? '签名中...' : isConfirming ? '确认中...' : '转账 10 Token'}
+      </button>
+      {isSuccess && <p>转账成功！Tx: {hash}</p>}
+    </div>
+  );
+}
+```
+
+### 6. EIP-712：结构化数据签名
+
+EIP-712 是对 `signMessage` 的升级，让用户看到可读的签名内容（而非一串 hex）：
+
+```typescript
+// 场景：用户授权 DApp 代为操作，无需每次发交易（无 Gas）
+
+// 定义数据结构（EIP-712 标准）
+const domain = {
+  name: 'MyDApp',
+  version: '1',
+  chainId: 1,
+  verifyingContract: '0xContractAddress...',
+};
+
+const types = {
+  Order: [
+    { name: 'buyer', type: 'address' },
+    { name: 'seller', type: 'address' },
+    { name: 'tokenId', type: 'uint256' },
+    { name: 'price', type: 'uint256' },
+    { name: 'deadline', type: 'uint256' },
+    { name: 'nonce', type: 'uint256' },
+  ],
+};
+
+const value = {
+  buyer: '0xBuyer...',
+  seller: '0xSeller...',
+  tokenId: 1234n,
+  price: ethers.parseEther('0.1'),
+  deadline: BigInt(Math.floor(Date.now() / 1000) + 3600), // 1小时后过期
+  nonce: 0n,
+};
+
+// 前端：用户签名（MetaMask 会显示结构化内容，用户能看懂）
+const signature = await signer.signTypedData(domain, types, value);
+
+// 后端/合约：验证签名
+const recoveredAddress = ethers.verifyTypedData(domain, types, value, signature);
+// 对比 recoveredAddress 与声明的 buyer 地址
+
+// 应用场景：
+// - 链下订单簿（如 OpenSea 的挂单）
+// - permit（ERC-20 无 Gas 授权）
+// - 链下投票（Snapshot）
+```
+
+### 7. 错误处理：常见链上错误
+
+```typescript
+async function safeContractCall<T>(fn: () => Promise<T>): Promise<{ data: T | null; error: string | null }> {
+  try {
+    const data = await fn();
+    return { data, error: null };
+  } catch (err: unknown) {
+    // ethers.js 错误类型
+    if (err instanceof Error) {
+      const message = err.message;
+
+      // 用户拒绝签名（MetaMask 点了 Reject）
+      if (message.includes('user rejected') || message.includes('ACTION_REJECTED')) {
+        return { data: null, error: '用户取消了操作' };
+      }
+
+      // Gas 不足
+      if (message.includes('insufficient funds')) {
+        return { data: null, error: 'ETH 余额不足以支付 Gas 费用' };
+      }
+
+      // 合约 revert（智能合约逻辑报错）
+      if (message.includes('execution reverted')) {
+        // 提取 revert 原因
+        const reason = message.match(/reason="([^"]+)"/)?.[1] ?? '合约执行失败';
+        return { data: null, error: reason };
+      }
+
+      // 网络问题
+      if (message.includes('network') || message.includes('timeout')) {
+        return { data: null, error: '网络连接失败，请检查 RPC 节点' };
+      }
+
+      // Nonce 问题（交易替换）
+      if (message.includes('nonce too low')) {
+        return { data: null, error: '交易 nonce 错误，请刷新页面重试' };
+      }
+    }
+
+    return { data: null, error: '未知错误，请重试' };
+  }
+}
+
+// 使用
+const { data, error } = await safeContractCall(() =>
+  contract.transfer(recipient, amount)
+);
+if (error) toast.error(error);
+```
+
+## 深入追问
+
+### approve + transferFrom 模式（DeFi 核心）
+
+```text
+问题：DApp 合约想帮你转移 Token，但合约没有你的私钥
+解决：两步操作
+
+步骤1：approve（用户授权合约额度）
+  你 → 调用 Token.approve(DAppContract, 100 USDC)
+  意思：允许 DAppContract 最多花费你 100 USDC
+
+步骤2：DApp 合约 transferFrom（合约代为转移）
+  DAppContract.deposit(100 USDC)
+  内部调用：USDC.transferFrom(你的地址, DApp合约, 100)
+
+安全注意：
+  ❌ 不要 approve(address, MAX_UINT256) 给不可信合约（一旦合约被攻击，资产全被盗）
+  ✅ 只 approve 刚好需要的金额
+  ✅ 操作完成后 approve(address, 0) 撤销授权
+```
+
+### RainbowKit：开箱即用的钱包 UI
+
+```typescript
+// 比手写钱包连接 UI 更省事
+import '@rainbow-me/rainbowkit/styles.css';
+import { RainbowKitProvider, ConnectButton } from '@rainbow-me/rainbowkit';
+
+function App() {
+  return (
+    <WagmiProvider config={config}>
+      <QueryClientProvider client={queryClient}>
+        <RainbowKitProvider>
+          <ConnectButton />  {/* 一行代码：完整的钱包连接按钮 */}
+        </RainbowKitProvider>
+      </QueryClientProvider>
+    </WagmiProvider>
+  );
+}
+
+// ConnectButton 内置：
+// - 多钱包支持（MetaMask、WalletConnect、Coinbase Wallet 等）
+// - 链切换
+// - 地址显示 + 复制
+// - 断开连接
+// - 响应式移动端适配
+```
+
+### 单位换算：wei / gwei / ether
+
+```typescript
+// 以太坊最小单位是 wei（10^-18 ETH），不要直接用 JS 浮点数！
+// 必须用 BigInt 进行链上计算
+
+// 单位层级：
+// 1 ETH = 10^9 Gwei = 10^18 wei
+
+// ethers.js 工具函数
+ethers.parseEther('1.5')          // 1.5 ETH → 1500000000000000000n (wei)
+ethers.parseUnits('100', 6)       // 100 USDC（6位小数）→ 100000000n
+ethers.formatEther(1500000000000000000n)  // → "1.5"
+ethers.formatUnits(100000000n, 6)         // → "100.0"
+
+// ❌ 错误：JS 浮点数精度问题
+const amount = 0.1 + 0.2;  // 0.30000000000000004
+// 在链上这会导致精度丢失！
+
+// ✅ 正确：全程 BigInt
+const amount = ethers.parseEther('0.1') + ethers.parseEther('0.2');
+// 300000000000000000n（精确）
+```

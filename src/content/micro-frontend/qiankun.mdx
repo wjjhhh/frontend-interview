@@ -1,0 +1,359 @@
+---
+title: "qiankun / single-spa 原理与沙箱隔离"
+description: "single-spa 生命周期、qiankun 沙箱机制、CSS 隔离、应用通信"
+difficulty: "高级"
+tags: ["qiankun", "single-spa", "JS沙箱", "CSS隔离", "微前端", "Proxy", "应用通信"]
+category: "micro-frontend"
+order: 3
+---
+
+## single-spa：微前端的协议层
+
+**single-spa** 是最早流行的微前端框架，它只做一件事：**基于路由，统一管理子应用的生命周期**。
+
+```text
+single-spa 的职责：
+  监听路由变化
+    → 匹配注册的子应用
+      → 调用对应子应用的 bootstrap / mount / unmount 钩子
+
+  它不负责：JS隔离、CSS隔离、资源加载（这些留给使用者）
+```
+
+qiankun 是蚂蚁金服基于 single-spa 封装的框架，补全了沙箱隔离、HTML Entry 加载等能力。
+
+## 高频面试题
+
+### 1. single-spa 子应用生命周期
+
+子应用必须暴露三个生命周期函数（ES Module 导出）：
+
+```javascript
+// 子应用入口（React 示例）
+let root;
+
+// bootstrap：只调用一次，适合做全局初始化（如注册全局事件）
+export async function bootstrap() {
+  console.log('子应用初始化');
+}
+
+// mount：每次激活时调用，渲染子应用
+export async function mount(props) {
+  const { container } = props; // 主应用传入的挂载容器
+  root = ReactDOM.createRoot(container.querySelector('#root'));
+  root.render(<App />);
+}
+
+// unmount：路由切走时调用，销毁子应用（必须清理干净！）
+export async function unmount() {
+  root.unmount();
+  root = null;
+}
+```
+
+```javascript
+// 主应用注册子应用
+import { registerApplication, start } from 'single-spa';
+
+registerApplication({
+  name: 'reactApp',
+  // 动态加载子应用资源（返回 { bootstrap, mount, unmount }）
+  app: () => import('http://localhost:3001/app.js'),
+  // 激活条件：当前路径以 /react 开头时挂载
+  activeWhen: (location) => location.pathname.startsWith('/react'),
+  // 传给子应用的 props
+  customProps: { authToken: 'xxx' },
+});
+
+start(); // 启动 single-spa 路由监听
+```
+
+---
+
+### 2. qiankun 对 single-spa 的增强
+
+```text
+single-spa 的痛点          qiankun 的解决方案
+─────────────────────────────────────────────────
+手动加载 JS/CSS 资源  →  HTML Entry（直接解析子应用 HTML）
+无 JS 隔离            →  JS 沙箱（快照 / Proxy）
+无 CSS 隔离           →  动态样式表 + Shadow DOM 可选
+通信繁琐              →  initGlobalState API
+```
+
+**HTML Entry 原理：**
+
+```text
+子应用不用改 webpack 配置暴露 JS 文件，
+qiankun 直接请求子应用 HTML（如 http://localhost:3001）
+  → 解析出 <script>、<link> 标签
+  → 逐一加载 JS/CSS 资源
+  → 在隔离环境中执行
+```
+
+```javascript
+// qiankun 主应用注册
+import { registerMicroApps, start } from 'qiankun';
+
+registerMicroApps([
+  {
+    name: 'reactApp',
+    entry: '//localhost:3001',   // 子应用地址（HTML Entry）
+    container: '#subapp-container', // 挂载到主应用的哪个 DOM 节点
+    activeRule: '/react',        // 路由激活规则
+    props: { token: 'xxx' },     // 传给子应用的数据
+  },
+]);
+
+start({
+  sandbox: { strictStyleIsolation: false, experimentalStyleIsolation: true },
+});
+```
+
+---
+
+### 3. JS 沙箱原理（核心重点）
+
+#### 快照沙箱（SnapshotSandbox）—— 用于不支持 Proxy 的环境
+
+```javascript
+class SnapshotSandbox {
+  constructor() {
+    this.windowSnapshot = {};   // 激活前 window 的快照
+    this.modifyMap = {};        // 沙箱运行期间的修改记录
+  }
+
+  // 激活：保存当前 window 状态，恢复上次修改
+  active() {
+    // 1. 给 window 拍快照
+    for (const key in window) {
+      this.windowSnapshot[key] = window[key];
+    }
+    // 2. 恢复上次沙箱运行时的修改
+    Object.keys(this.modifyMap).forEach(key => {
+      window[key] = this.modifyMap[key];
+    });
+  }
+
+  // 失活：记录修改，还原 window
+  inactive() {
+    for (const key in window) {
+      if (window[key] !== this.windowSnapshot[key]) {
+        // 记录这次修改
+        this.modifyMap[key] = window[key];
+        // 还原为激活前的值
+        window[key] = this.windowSnapshot[key];
+      }
+    }
+  }
+}
+```
+
+**缺点**：遍历 window 性能差，且同一时刻只能激活一个沙箱（不支持多实例）。
+
+---
+
+#### Proxy 沙箱（ProxySandbox）—— qiankun 默认方案
+
+```javascript
+class ProxySandbox {
+  constructor() {
+    this.fakeWindow = {};      // 子应用专属的"假 window"
+    this.active = false;
+
+    this.proxy = new Proxy(this.fakeWindow, {
+      set(target, key, value) {
+        if (this.active) {
+          target[key] = value; // 写操作只影响 fakeWindow
+        }
+        return true;
+      },
+      get(target, key) {
+        // 优先从 fakeWindow 读，没有再从真实 window 读
+        return key in target ? target[key] : window[key];
+      },
+      has(target, key) {
+        // 使 with(proxy){} 语句中的变量查找能命中 proxy
+        return key in target || key in window;
+      }
+    });
+  }
+
+  activate() { this.active = true; }
+  deactivate() { this.active = false; }
+}
+
+// 子应用代码被包裹在 with(proxy) 中执行：
+// with(sandbox.proxy) {
+//   window.foo = 'bar'; // 实际写到 fakeWindow，不污染真实 window
+// }
+```
+
+**优点**：
+- 每个子应用有独立的 `fakeWindow`，支持**多个子应用同时运行**
+- 性能好（按需拦截，不用遍历整个 window）
+- 子应用卸载时 `fakeWindow` 直接丢弃，无需还原
+
+---
+
+### 4. CSS 隔离方案
+
+#### 方案一：动态加载/卸载样式表
+
+```text
+子应用激活时：将子应用的 <style>/<link> 插入 document.head
+子应用失活时：移除这些样式
+问题：同一时刻多个子应用并存时无效，且切换有闪烁
+```
+
+#### 方案二：scoped CSS（qiankun experimentalStyleIsolation）
+
+```text
+给子应用所有 CSS 选择器加上属性选择器前缀：
+
+原始：  .btn { color: red; }
+转换后：div[data-qiankun="reactApp"] .btn { color: red; }
+
+原理：qiankun 解析子应用 CSS，用正则为每条规则加前缀
+缺点：不处理动态插入的样式、:root 伪类等边界情况
+```
+
+#### 方案三：Shadow DOM（strictStyleIsolation）
+
+```javascript
+start({ sandbox: { strictStyleIsolation: true } });
+// qiankun 将子应用挂载到 Shadow Host 中
+// Shadow DOM 内的 CSS 完全隔离，不影响外部
+```
+
+```text
+优点：隔离最彻底（浏览器原生支持）
+缺点：
+  - 弹窗/Modal 挂载到 document.body 时逃出了 Shadow DOM，样式丢失
+  - antd 等组件库的 getContainer 默认挂 body，需要额外配置
+  - 与一些第三方库不兼容
+```
+
+---
+
+### 5. 应用间通信
+
+#### qiankun 官方方案：initGlobalState
+
+```javascript
+// 主应用
+import { initGlobalState } from 'qiankun';
+
+const actions = initGlobalState({ user: null, theme: 'light' });
+
+// 监听全局状态变化
+actions.onGlobalStateChange((state, prev) => {
+  console.log('主应用监听到变化:', state);
+});
+
+// 修改全局状态（会通知所有监听者）
+actions.setGlobalState({ user: { name: '张三' } });
+```
+
+```javascript
+// 子应用（通过 props 接收 onGlobalStateChange 和 setGlobalState）
+export async function mount(props) {
+  const { onGlobalStateChange, setGlobalState } = props;
+
+  onGlobalStateChange((state) => {
+    console.log('子应用监听到:', state.user);
+  });
+
+  // 子应用触发状态变更
+  setGlobalState({ theme: 'dark' });
+}
+```
+
+#### 自定义 EventBus 方案
+
+```javascript
+// shared/eventBus.js（主应用暴露到 window）
+class EventBus {
+  constructor() { this.events = {}; }
+
+  on(event, cb) {
+    (this.events[event] ??= []).push(cb);
+    return () => this.off(event, cb); // 返回取消订阅函数
+  }
+
+  emit(event, data) {
+    this.events[event]?.forEach(cb => cb(data));
+  }
+
+  off(event, cb) {
+    this.events[event] = this.events[event]?.filter(fn => fn !== cb);
+  }
+}
+
+window.__MF_EVENT_BUS__ = new EventBus();
+
+// 子应用使用
+window.__MF_EVENT_BUS__.on('user:logout', () => { /* 清理本地状态 */ });
+window.__MF_EVENT_BUS__.emit('cart:update', { count: 3 });
+```
+
+---
+
+### 6. 子应用改造要点
+
+```javascript
+// 子应用 src/index.js —— 支持独立运行 + 被 qiankun 接管两种模式
+
+// 判断是否在 qiankun 环境中
+const isInQiankun = window.__POWERED_BY_QIANKUN__;
+
+// 独立运行时直接渲染
+if (!isInQiankun) {
+  render({ container: document.getElementById('root') });
+}
+
+// 暴露生命周期
+export async function bootstrap() {}
+
+export async function mount(props) {
+  render({ container: props.container });
+}
+
+export async function unmount(props) {
+  root.unmount();
+}
+
+// webpack 配置：子应用必须打包为 UMD，让主应用能挂 window.xxx
+// webpack.config.js
+output: {
+  library: `${packageName}-[name]`,
+  libraryTarget: 'umd',
+  // Webpack 5：
+  chunkLoadingGlobal: `webpackJsonp_${packageName}`,
+}
+```
+
+---
+
+### 7. 常见面试追问
+
+**Q：qiankun 的 Proxy 沙箱能覆盖所有全局污染吗？**
+
+```text
+不能完全覆盖，已知逃逸场景：
+  1. setTimeout/setInterval 回调中的 window 访问（不在 with 作用域）
+  2. Web Worker 中的全局状态
+  3. 原型链修改（Array.prototype.xxx = ...）
+  4. 通过 document 操作 DOM（document 未被代理）
+
+qiankun 对 addEventListener 等也做了额外处理（记录并在卸载时清除）
+```
+
+**Q：子应用切换白屏怎么排查？**
+
+```text
+1. unmount 没有正确清理 React root → 残留 DOM
+2. CSS 加载时序问题 → 新子应用样式覆盖了挂载点样式
+3. 路由 base 未配置 → 子应用内部路由 history.push 路径错误
+4. 资源跨域 → 子应用静态资源需要配置 CORS
+```

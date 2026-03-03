@@ -1,0 +1,469 @@
+---
+title: "React 高级组件设计模式"
+description: "受控/非受控、复合组件、Render Props、HOC、自定义 Hook 替代方案、多态组件"
+difficulty: "高级"
+tags: ["设计模式", "HOC", "Render Props", "复合组件", "受控组件", "TypeScript"]
+category: "react"
+order: 7
+---
+
+## 模式演进脉络
+
+```text
+早期 React（Class 组件时代）
+  ├── Mixin（已废弃，逻辑混乱）
+  ├── HOC（高阶组件）
+  └── Render Props
+
+Hooks 时代
+  └── 自定义 Hook（取代大多数 HOC 和 Render Props 场景）
+
+现代 React
+  ├── 复合组件（Compound Component）
+  ├── 多态组件（as prop）
+  └── 受控/非受控统一模式
+```
+
+## 高频面试题
+
+### 1. 受控组件 vs 非受控组件
+
+**受控**：表单值由 React state 管理，是"单一数据源"。
+**非受控**：表单值由 DOM 自己管理，用 `ref` 按需读取。
+
+```tsx
+// ✅ 受控组件：值完全由 state 控制
+function ControlledForm() {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+
+  function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    // 直接用 state，不需要读取 DOM
+    login(email, password);
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input value={email} onChange={(e) => setEmail(e.target.value)} />
+      <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
+    </form>
+  );
+}
+
+// ✅ 非受控组件：用 ref 按需读取（适合文件上传、第三方 DOM 库集成）
+function UncontrolledForm() {
+  const emailRef = useRef<HTMLInputElement>(null);
+  const passwordRef = useRef<HTMLInputElement>(null);
+
+  function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    login(emailRef.current!.value, passwordRef.current!.value);
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input ref={emailRef} defaultValue="" />         {/* defaultValue 不受控 */}
+      <input type="password" ref={passwordRef} />
+    </form>
+  );
+}
+```
+
+**选择原则：**
+
+| 需求 | 推荐方式 |
+|------|---------|
+| 实时验证、格式化输入 | 受控 |
+| 字段间联动（密码确认） | 受控 |
+| 简单表单、性能敏感（大表单） | 非受控 |
+| 文件上传（`<input type="file">`） | 只能非受控 |
+| 集成第三方 DOM 库 | 非受控 |
+
+### 2. 复合组件（Compound Component）
+
+将**相关联的组件**打包成一个语义单元，通过 Context 共享内部状态：
+
+```tsx
+// 场景：Select 下拉组件（Trigger + Options 需要共享 open/value 状态）
+
+interface SelectContextValue {
+  value: string;
+  onChange: (v: string) => void;
+  open: boolean;
+  setOpen: (o: boolean) => void;
+}
+
+const SelectContext = createContext<SelectContextValue | null>(null);
+
+function useSelectContext() {
+  const ctx = useContext(SelectContext);
+  if (!ctx) throw new Error('必须在 <Select> 内使用');
+  return ctx;
+}
+
+// 根组件：提供状态
+function Select({ children, value, onChange }: {
+  children: React.ReactNode;
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <SelectContext.Provider value={{ value, onChange, open, setOpen }}>
+      <div className="relative">{children}</div>
+    </SelectContext.Provider>
+  );
+}
+
+// 子组件：消费状态
+Select.Trigger = function SelectTrigger({ children }: { children: React.ReactNode }) {
+  const { open, setOpen, value } = useSelectContext();
+  return (
+    <button onClick={() => setOpen(!open)}>
+      {value || children}
+    </button>
+  );
+};
+
+Select.Options = function SelectOptions({ children }: { children: React.ReactNode }) {
+  const { open } = useSelectContext();
+  if (!open) return null;
+  return <div className="absolute top-full w-full border">{children}</div>;
+};
+
+Select.Option = function SelectOption({ value, children }: { value: string; children: React.ReactNode }) {
+  const { onChange, setOpen, value: selected } = useSelectContext();
+  return (
+    <div
+      className={selected === value ? 'bg-blue-50' : ''}
+      onClick={() => { onChange(value); setOpen(false); }}
+    >
+      {children}
+    </div>
+  );
+};
+
+// 使用：语义清晰，结构灵活
+function App() {
+  const [lang, setLang] = useState('');
+  return (
+    <Select value={lang} onChange={setLang}>
+      <Select.Trigger>选择语言</Select.Trigger>
+      <Select.Options>
+        <Select.Option value="zh">中文</Select.Option>
+        <Select.Option value="en">English</Select.Option>
+        <Select.Option value="ja">日本語</Select.Option>
+      </Select.Options>
+    </Select>
+  );
+}
+```
+
+**优点**：使用方可以自由排列子组件顺序、插入自定义内容（如分隔线、图标），而不需要修改组件 API。
+
+### 3. Render Props 模式
+
+将**渲染逻辑作为函数 prop** 传入，组件负责数据和行为，使用方决定如何渲染：
+
+```tsx
+// Render Props：将 data 和 UI 分离
+interface MousePosition {
+  x: number;
+  y: number;
+}
+
+function MouseTracker({ render }: { render: (pos: MousePosition) => React.ReactNode }) {
+  const [position, setPosition] = useState<MousePosition>({ x: 0, y: 0 });
+
+  return (
+    <div
+      style={{ height: '300px', border: '1px solid' }}
+      onMouseMove={(e) => setPosition({ x: e.clientX, y: e.clientY })}
+    >
+      {render(position)}  {/* 使用方决定如何渲染 */}
+    </div>
+  );
+}
+
+// 使用1：显示坐标
+<MouseTracker render={({ x, y }) => <p>鼠标位置：{x}, {y}</p>} />
+
+// 使用2：跟随鼠标的光标
+<MouseTracker render={({ x, y }) => (
+  <div style={{ position: 'fixed', left: x, top: y, pointerEvents: 'none' }}>
+    🐭
+  </div>
+)} />
+```
+
+**用 children 作为函数（更常见）：**
+
+```tsx
+// children as a function（本质是 render props）
+function Toggle({ children }: { children: (state: { on: boolean; toggle: () => void }) => React.ReactNode }) {
+  const [on, setOn] = useState(false);
+  return <>{children({ on, toggle: () => setOn((v) => !v) })}</>;
+}
+
+// 使用
+<Toggle>
+  {({ on, toggle }) => (
+    <button onClick={toggle}>{on ? '关闭' : '开启'}</button>
+  )}
+</Toggle>
+```
+
+### 4. HOC（高阶组件）
+
+HOC 是接收组件、返回增强组件的**函数**，用于横切关注点（权限、日志、主题）：
+
+```tsx
+// HOC：为组件添加权限控制
+function withAuth<P extends { user?: User }>(
+  Component: React.ComponentType<P>,
+  requiredRole: string
+) {
+  return function AuthenticatedComponent(props: P) {
+    const { user } = useAuth();
+
+    if (!user) return <Redirect to="/login" />;
+    if (!user.roles.includes(requiredRole)) return <Forbidden />;
+
+    return <Component {...props} user={user} />;
+  };
+}
+
+// 使用：AdminPage 自动获得权限校验
+const ProtectedAdminPage = withAuth(AdminPage, 'admin');
+
+// HOC 的问题：
+// 1. Wrapper Hell（多个 HOC 嵌套，DevTools 难以调试）
+// 2. Props 冲突（多个 HOC 注入同名 prop 会覆盖）
+// 3. Ref 无法穿透（需要 forwardRef）
+// 4. 静态方法丢失（需要 hoist-non-react-statics）
+```
+
+**HOC vs 自定义 Hook 的选择：**
+
+```tsx
+// ❌ HOC 方案：包裹组件，增加层级
+const ComponentWithLogging = withLogging(MyComponent);
+const ComponentWithTheme = withTheme(ComponentWithLogging);
+const ComponentWithAuth = withAuth(ComponentWithTheme); // 三层嵌套
+
+// ✅ 自定义 Hook 方案：逻辑组合，不增加层级
+function MyComponent() {
+  useLogging('MyComponent');       // 自定义 Hook 直接组合
+  const theme = useTheme();
+  const { user } = useAuth();
+  // ...
+}
+```
+
+> **结论**：新代码优先用自定义 Hook。HOC 仍适合**需要修改渲染输出**的场景（如 `React.memo`、`React.lazy`，或者必须用类组件的遗留代码库）。
+
+### 5. 自定义 Hook 的设计原则
+
+```tsx
+// 原则1：单一职责——一个 Hook 做一件事
+function useWindowSize() {
+  const [size, setSize] = useState({ width: window.innerWidth, height: window.innerHeight });
+  useEffect(() => {
+    const handler = () => setSize({ width: window.innerWidth, height: window.innerHeight });
+    window.addEventListener('resize', handler);
+    return () => window.removeEventListener('resize', handler);
+  }, []);
+  return size;
+}
+
+// 原则2：返回稳定引用——避免不必要的重渲染
+function useUsers() {
+  const [users, setUsers] = useState<User[]>([]);
+
+  // ✅ 用 useCallback 稳定 refetch 引用
+  const refetch = useCallback(async () => {
+    const data = await fetchUsers();
+    setUsers(data);
+  }, []);
+
+  useEffect(() => { refetch(); }, [refetch]);
+
+  return { users, refetch }; // refetch 引用稳定，不会导致 useEffect 重触发
+}
+
+// 原则3：组合而非继承——Hook 可以调用其他 Hook
+function useAuthenticatedQuery<T>(
+  queryKey: string[],
+  queryFn: () => Promise<T>
+) {
+  const { token } = useAuth();           // 复用认证 Hook
+  const { addToast } = useToast();       // 复用通知 Hook
+
+  return useQuery({
+    queryKey,
+    queryFn,
+    enabled: !!token,                    // 未登录不请求
+    onError: (err) => addToast(err.message, 'error'),
+  });
+}
+```
+
+### 6. 多态组件（as prop / polymorphic）
+
+让组件的根元素可配置，同时保持 TypeScript 类型安全：
+
+```tsx
+// 问题：<Button> 有时需要渲染成 <a>，有时 <button>，有时 <Link>
+
+// 方案：as prop + 泛型类型推断
+type PolymorphicRef<C extends React.ElementType> =
+  React.ComponentPropsWithRef<C>['ref'];
+
+type PolymorphicProps<C extends React.ElementType, Props = {}> = {
+  as?: C;
+} & Props &
+  Omit<React.ComponentPropsWithoutRef<C>, keyof Props | 'as'>;
+
+function Button<C extends React.ElementType = 'button'>({
+  as,
+  children,
+  variant = 'primary',
+  ...props
+}: PolymorphicProps<C, { variant?: 'primary' | 'ghost'; children: React.ReactNode }>) {
+  const Component = as ?? 'button';
+  return (
+    <Component
+      className={`btn btn-${variant}`}
+      {...props}
+    >
+      {children}
+    </Component>
+  );
+}
+
+// TypeScript 自动推断正确的 props 类型！
+<Button>默认按钮</Button>                           // as="button"，有 type、disabled 等
+<Button as="a" href="/home">链接按钮</Button>        // as="a"，有 href、target 等
+<Button as={Link} to="/home">路由按钮</Button>       // as=Link，有 to 等
+// <Button as="a" type="submit">...</Button>       // ❌ TypeScript 报错：a 没有 type
+```
+
+### 7. Provider 模式（组合多个 Context）
+
+```tsx
+// 问题：多个 Provider 嵌套导致"Provider Hell"
+function App() {
+  return (
+    <ThemeProvider>
+      <AuthProvider>
+        <RouterProvider>
+          <QueryClientProvider client={queryClient}>
+            <ToastProvider>
+              <AppContent />   {/* 嵌套5层 */}
+            </ToastProvider>
+          </QueryClientProvider>
+        </RouterProvider>
+      </AuthProvider>
+    </ThemeProvider>
+  );
+}
+
+// ✅ 方案：compose 函数合并 Providers
+type ProviderComponent = React.ComponentType<{ children: React.ReactNode }>;
+
+function composeProviders(...providers: ProviderComponent[]) {
+  return function ComposedProvider({ children }: { children: React.ReactNode }) {
+    return providers.reduceRight(
+      (acc, Provider) => <Provider>{acc}</Provider>,
+      children
+    );
+  };
+}
+
+const AppProviders = composeProviders(
+  ThemeProvider,
+  AuthProvider,
+  RouterProvider,
+  ({ children }) => <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>,
+  ToastProvider,
+);
+
+// 使用：扁平化
+function App() {
+  return (
+    <AppProviders>
+      <AppContent />
+    </AppProviders>
+  );
+}
+```
+
+## 进阶追问
+
+### 受控组件的"非受控"陷阱
+
+```tsx
+// ❌ 经典陷阱：value 从有值变成 undefined，组件从受控变为非受控，React 报警告
+function BadInput({ value }: { value?: string }) {
+  // 当 value 为 undefined 时，input 变成非受控
+  return <input value={value} onChange={...} />;
+  // Warning: A component is changing a controlled input to be uncontrolled.
+}
+
+// ✅ 永远保证受控组件的 value 不为 undefined
+function GoodInput({ value }: { value?: string }) {
+  return <input value={value ?? ''} onChange={...} />;
+}
+```
+
+### 实现一个支持受控/非受控两种模式的组件
+
+```tsx
+// 类似 Ant Design 的 useControllableValue 模式
+function useControllable<T>(
+  value: T | undefined,
+  onChange: ((v: T) => void) | undefined,
+  defaultValue: T
+): [T, (v: T) => void] {
+  const [internalValue, setInternalValue] = useState<T>(defaultValue);
+
+  // 受控模式：使用外部 value
+  // 非受控模式：使用内部 state
+  const isControlled = value !== undefined;
+  const current = isControlled ? value : internalValue;
+
+  const handleChange = useCallback(
+    (newValue: T) => {
+      if (!isControlled) {
+        setInternalValue(newValue); // 非受控：更新内部 state
+      }
+      onChange?.(newValue);        // 两种模式都通知外部
+    },
+    [isControlled, onChange]
+  );
+
+  return [current, handleChange];
+}
+
+// 使用
+function Toggle({
+  checked,          // 受控：从外部传入
+  defaultChecked,   // 非受控：只用于初始值
+  onChange,
+}: {
+  checked?: boolean;
+  defaultChecked?: boolean;
+  onChange?: (v: boolean) => void;
+}) {
+  const [on, setOn] = useControllable(checked, onChange, defaultChecked ?? false);
+
+  return <button onClick={() => setOn(!on)}>{on ? 'ON' : 'OFF'}</button>;
+}
+
+// 受控模式
+<Toggle checked={value} onChange={setValue} />
+
+// 非受控模式
+<Toggle defaultChecked={true} onChange={(v) => console.log('changed:', v)} />
+```

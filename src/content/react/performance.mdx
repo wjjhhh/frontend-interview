@@ -1,0 +1,344 @@
+---
+title: "React 性能优化实战"
+description: "渲染优化、代码分割、状态管理优化、Profiler 工具使用"
+difficulty: "高级"
+tags: ["性能优化", "memo", "代码分割", "状态下移", "Profiler"]
+category: "react"
+order: 4
+---
+
+## 核心原则
+
+React 渲染性能问题本质是**不必要的重渲染**。优化前先用 React DevTools Profiler 定位真正的瓶颈，不要过早优化。
+
+## 高频面试题
+
+### 1. 避免不必要渲染的三板斧
+
+**① 状态下移（State Colocation）——最有效，零开销**
+
+```tsx
+// ❌ 问题：color state 变化导致整个 App 重渲染
+function App() {
+  const [color, setColor] = useState('red');
+  return (
+    <>
+      <input value={color} onChange={(e) => setColor(e.target.value)} />
+      <p style={{ color }}>颜色预览</p>
+      <HeavyComponent />  {/* 每次输入都重渲染 */}
+    </>
+  );
+}
+
+// ✅ 状态下移：将 color 相关逻辑封装进独立组件
+function ColorPicker() {
+  const [color, setColor] = useState('red');
+  return (
+    <>
+      <input value={color} onChange={(e) => setColor(e.target.value)} />
+      <p style={{ color }}>颜色预览</p>
+    </>
+  );
+}
+
+function App() {
+  return (
+    <>
+      <ColorPicker />
+      <HeavyComponent />  {/* 不再重渲染 ✅ */}
+    </>
+  );
+}
+```
+
+**② 内容提升（Lifting Content Up / Children as Props）**
+
+```tsx
+// ✅ 将不变的内容作为 children 传入，避免被包裹组件的状态影响
+function ScrollContainer({ children }) {
+  const [scrollTop, setScrollTop] = useState(0);
+  return (
+    <div onScroll={(e) => setScrollTop(e.target.scrollTop)}>
+      {children}  {/* children 是从外部传入的，不受 scrollTop 影响 */}
+    </div>
+  );
+}
+
+function App() {
+  return (
+    <ScrollContainer>
+      <HeavyComponent />  {/* scrollTop 变化不会重渲染它 ✅ */}
+    </ScrollContainer>
+  );
+}
+```
+
+**③ React.memo + useCallback/useMemo**
+
+```tsx
+// 只有 props 真正变化时才重渲染
+const ExpensiveList = React.memo(function ExpensiveList({ items, onDelete }) {
+  return items.map((item) => (
+    <Item key={item.id} data={item} onDelete={onDelete} />
+  ));
+});
+
+function Parent() {
+  const [count, setCount] = useState(0);
+  const [items, setItems] = useState(initialItems);
+
+  // ✅ 稳定的函数引用
+  const handleDelete = useCallback((id) => {
+    setItems((prev) => prev.filter((item) => item.id !== id));
+  }, []);
+
+  return (
+    <>
+      <button onClick={() => setCount((c) => c + 1)}>{count}</button>
+      <ExpensiveList items={items} onDelete={handleDelete} />
+    </>
+  );
+}
+```
+
+### 2. 虚拟化长列表
+
+```tsx
+import { useVirtualizer } from '@tanstack/react-virtual';
+
+function VirtualList({ items }) {
+  const parentRef = useRef(null);
+
+  const virtualizer = useVirtualizer({
+    count: items.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 50, // 每行预估高度
+    overscan: 5,            // 超出可视区域多渲染的行数
+  });
+
+  return (
+    <div ref={parentRef} style={{ height: '500px', overflow: 'auto' }}>
+      <div style={{ height: virtualizer.getTotalSize() }}>
+        {virtualizer.getVirtualItems().map((virtualRow) => (
+          <div
+            key={virtualRow.index}
+            style={{
+              position: 'absolute',
+              top: virtualRow.start,
+              height: virtualRow.size,
+              width: '100%',
+            }}
+          >
+            {items[virtualRow.index]}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+### 3. 代码分割
+
+```tsx
+import { lazy, Suspense } from 'react';
+
+// 路由级分割
+const Dashboard = lazy(() => import('./pages/Dashboard'));
+const Settings = lazy(() => import('./pages/Settings'));
+
+function App() {
+  return (
+    <Suspense fallback={<PageLoader />}>
+      <Routes>
+        <Route path="/dashboard" element={<Dashboard />} />
+        <Route path="/settings" element={<Settings />} />
+      </Routes>
+    </Suspense>
+  );
+}
+
+// 组件级分割：条件渲染的重型组件
+const HeavyModal = lazy(() => import('./HeavyModal'));
+
+function Page() {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button onClick={() => setOpen(true)}>打开</button>
+      {open && (
+        <Suspense fallback={<ModalSkeleton />}>
+          <HeavyModal onClose={() => setOpen(false)} />
+        </Suspense>
+      )}
+    </>
+  );
+}
+```
+
+### 4. Context 性能问题与解决
+
+```tsx
+// ❌ 问题：context value 每次渲染都是新对象，导致所有消费者重渲染
+function AuthProvider({ children }) {
+  const [user, setUser] = useState(null);
+  return (
+    <AuthContext.Provider value={{ user, setUser }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+// ✅ 方案1：拆分 context（读写分离）
+const AuthStateContext = createContext(null);
+const AuthDispatchContext = createContext(null);
+
+function AuthProvider({ children }) {
+  const [user, setUser] = useState(null);
+  return (
+    <AuthStateContext.Provider value={user}>
+      <AuthDispatchContext.Provider value={setUser}>
+        {children}
+      </AuthDispatchContext.Provider>
+    </AuthStateContext.Provider>
+  );
+}
+
+// ✅ 方案2：useMemo 稳定 value
+function AuthProvider({ children }) {
+  const [user, setUser] = useState(null);
+  const value = useMemo(() => ({ user, setUser }), [user]);
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
+```
+
+### 5. 用 key 强制重置组件状态
+
+```tsx
+// 场景：切换用户时，需要完全重置表单所有状态
+// ❌ 用 useEffect 手动重置：繁琐且容易漏掉状态
+function ProfileForm({ userId }) {
+  const [name, setName] = useState('');
+  const [bio, setBio] = useState('');
+  const [avatar, setAvatar] = useState('');
+
+  useEffect(() => {
+    // 如果有10个状态字段，要写10个 set...
+    setName(''); setBio(''); setAvatar('');
+  }, [userId]);
+}
+
+// ✅ 用 key 强制卸载重建，所有状态自动初始化
+function App({ userId }) {
+  return <ProfileForm key={userId} userId={userId} />;
+  // key 变化 → 旧组件卸载（触发 cleanup）→ 新组件挂载 → 状态全部初始化 ✅
+}
+```
+
+> 同样适用于：切换 tab 重置滚动位置、切换图表类型重置动画状态等场景。
+
+### 6. useDeferredValue + Suspense：无 loading 闪烁的搜索
+
+```tsx
+// 传统方式：query 变化 → Suspense 显示 fallback → 显示新结果（内容"闪"）
+// 使用 useDeferredValue：query 变化时旧内容继续显示，新内容就绪后平滑切换
+
+function SearchPage() {
+  const [query, setQuery] = useState('');
+  const deferredQuery = useDeferredValue(query);
+  const isStale = query !== deferredQuery; // 是否有待处理的更新
+
+  return (
+    <>
+      <input value={query} onChange={(e) => setQuery(e.target.value)} />
+      {/* isStale 时旧内容半透明展示，不会触发 Suspense fallback */}
+      <div style={{ opacity: isStale ? 0.7 : 1, transition: 'opacity 0.2s' }}>
+        <Suspense fallback={<Spinner />}>
+          {/* SearchResults 内部使用 use(promise) 读取数据 */}
+          <SearchResults query={deferredQuery} />
+        </Suspense>
+      </div>
+    </>
+  );
+}
+```
+
+**关键**：`<SearchResults>` 需用 `React.memo` 包裹，否则即使 `deferredQuery` 未变也会重渲染。
+
+### 7. Context 选择器模式（精确订阅）
+
+React Context 没有内置选择器——任何 context 值变化都触发**所有**消费者重渲染。解决方案是用 `useSyncExternalStore` 构建外部 store：
+
+```tsx
+function createStore<T>(initialState: T) {
+  let state = initialState;
+  const listeners = new Set<() => void>();
+
+  const subscribe = (listener: () => void) => {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  };
+
+  const setState = (updater: (s: T) => T) => {
+    state = updater(state);
+    listeners.forEach((l) => l());
+  };
+
+  // 精确订阅：只有 selector 返回值变化时才触发重渲染
+  function useSelector<R>(selector: (s: T) => R): R {
+    return useSyncExternalStore(subscribe, () => selector(state));
+  }
+
+  return { setState, useSelector };
+}
+
+// 使用：user/cart/theme 变化互不影响
+const appStore = createStore({ user: null, cart: [] as CartItem[], theme: 'light' });
+
+function UserName() {
+  // 只订阅 user.name，cart 或 theme 变化不触发重渲染 ✅
+  const name = appStore.useSelector((s) => s.user?.name);
+  return <span>{name}</span>;
+}
+
+function CartCount() {
+  const count = appStore.useSelector((s) => s.cart.length);
+  return <span>{count}</span>;
+}
+```
+
+> 这也是 Zustand 的核心实现原理。如果项目已用 Zustand/Jotai，直接使用即可；如果只有 Context，可以考虑 `use-context-selector` 库。
+
+## 深入追问
+
+### 使用 React DevTools Profiler 排查渲染问题
+
+1. 打开 DevTools → Profiler 面板
+2. 点击录制，操作页面，停止录制
+3. 查看**火焰图**：颜色越黄/红说明渲染耗时越长
+4. 点击组件查看**"Why did this render?"**（需开启 Record why each component rendered）
+5. 找到高频重渲染的组件，针对性优化
+
+### transition 与 Suspense 配合优化用户体验
+
+```tsx
+function SearchResults({ query }) {
+  const [isPending, startTransition] = useTransition();
+  const [displayQuery, setDisplayQuery] = useState(query);
+
+  function handleSearch(newQuery) {
+    startTransition(() => {
+      setDisplayQuery(newQuery);
+    });
+  }
+
+  return (
+    <div style={{ opacity: isPending ? 0.5 : 1 }}>
+      <Suspense fallback={<ResultsSkeleton />}>
+        {/* displayQuery 变化时，旧内容保持显示直到新内容就绪 */}
+        <Results query={displayQuery} />
+      </Suspense>
+    </div>
+  );
+}
+```

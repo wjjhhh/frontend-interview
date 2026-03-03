@@ -11,7 +11,7 @@ import {
 import { getCategories, getAllPosts } from "@/lib/content";
 import {
   Braces, FileType, Atom, LayoutTemplate, Palette,
-  Settings, Zap, Globe, Monitor, Binary,
+  Settings, Zap, Globe, Monitor, Binary, Layers, Smartphone, Bot,
 } from "lucide-react";
 
 const iconMap: Record<string, React.ComponentType<{ className?: string }>> = {
@@ -25,6 +25,9 @@ const iconMap: Record<string, React.ComponentType<{ className?: string }>> = {
   globe: Globe,
   monitor: Monitor,
   binary: Binary,
+  layers: Layers,
+  smartphone: Smartphone,
+  bot: Bot,
 };
 
 export default function HomePage() {

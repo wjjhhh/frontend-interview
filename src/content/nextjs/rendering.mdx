@@ -1,0 +1,420 @@
+---
+title: "Next.js 渲染策略与 Server Actions"
+description: "SSR/SSG/ISR/PPR 原理对比、流式渲染、Server Actions 原理、内置优化（Image/Font/Script）"
+difficulty: "高级"
+tags: ["SSR", "SSG", "ISR", "PPR", "Server Actions", "流式渲染", "Image优化"]
+category: "nextjs"
+order: 3
+---
+
+## 渲染策略全景
+
+```text
+                构建时                        请求时
+                ──────                        ──────
+完全静态         SSG ──────────────────────────────────── 秒级响应
+                 │    Full Route Cache
+部分静态+动态    PPR ──── 静态壳 ──────────── + 动态内容（Suspense 流式填充）
+时间驱动更新     ISR ──── 过期后后台重渲染 ─────────────── 近实时
+完全动态         SSR ──────────────────────────────────── 每次请求渲染
+```
+
+## 高频面试题
+
+### 1. SSG / SSR / ISR 原理与对比
+
+**SSG（Static Site Generation）：构建时渲染**
+
+```tsx
+// app/blog/[slug]/page.tsx
+// generateStaticParams 返回的 slug 列表在构建时全部预渲染
+export async function generateStaticParams() {
+  const posts = await fetch('https://api.example.com/posts').then(r => r.json());
+  return posts.map((post: { slug: string }) => ({ slug: post.slug }));
+}
+
+export default async function BlogPost({ params }: { params: Promise<{ slug: string }> }) {
+  const { slug } = await params;
+  const post = await fetch(`https://api.example.com/posts/${slug}`, {
+    cache: 'force-cache', // 明确使用缓存（Next.js 15）
+  }).then(r => r.json());
+
+  return <article>{post.content}</article>;
+}
+
+// 适合：博客、文档、营销页面（内容不频繁变化）
+// 优点：CDN 分发，响应时间 <10ms
+// 缺点：内容更新需要重新构建
+```
+
+**SSR（Server-Side Rendering）：每次请求渲染**
+
+```tsx
+// 只要组件使用了动态函数，Next.js 自动切换为 SSR
+import { cookies, headers } from 'next/headers';
+
+export default async function Dashboard() {
+  const cookieStore = cookies(); // 使用动态函数 → 自动变成 SSR
+  const token = cookieStore.get('token')?.value;
+
+  const user = await fetch(`https://api.example.com/me`, {
+    headers: { Authorization: `Bearer ${token}` },
+    cache: 'no-store', // 每次请求获取最新数据
+  }).then(r => r.json());
+
+  return <DashboardContent user={user} />;
+}
+
+// 适合：个人化数据（用户仪表盘、购物车）、实时性强的内容
+// 优点：数据永远最新
+// 缺点：TTFB 较高，需要服务器资源
+```
+
+**ISR（Incremental Static Regeneration）：时间驱动更新**
+
+```tsx
+// 方式1：路由级别 revalidate
+export const revalidate = 60; // 整个路由 60 秒后过期
+
+// 方式2：fetch 级别
+const products = await fetch('https://api.example.com/products', {
+  next: { revalidate: 60 },
+});
+
+// ISR 工作原理（Stale-While-Revalidate）：
+// 1. 首次请求：渲染并缓存页面
+// 2. 60秒内的请求：直接返回缓存（stale 但快）
+// 3. 60秒后的首次请求：仍返回旧缓存，同时后台触发重新渲染
+// 4. 下一次请求：返回新缓存
+
+// 适合：商品价格、新闻列表（可接受轻微延迟）
+```
+
+### 2. 流式渲染（Streaming）与 Suspense
+
+传统 SSR 必须等所有数据就绪才能发送 HTML；流式渲染允许**分块发送**：
+
+```text
+传统 SSR：
+  等待所有数据 ──────────────────────────► 一次性发送完整 HTML
+                      3s                    3s TTFB
+
+流式渲染：
+  静态壳立即发送 ──► 数据1就绪发送 ──► 数据2就绪发送
+       50ms               1s                3s
+                   ↑                   ↑
+               Suspense 边界1        Suspense 边界2
+               填充 Comments         填充 Recommendations
+```
+
+```tsx
+// app/blog/[slug]/page.tsx
+import { Suspense } from 'react';
+
+export default async function BlogPost({ params }: { params: Promise<{ slug: string }> }) {
+  const { slug } = await params;
+  // 主文章内容：等待后直接渲染（不流式）
+  const post = await getPost(slug);
+
+  return (
+    <article>
+      <h1>{post.title}</h1>
+      <PostContent content={post.content} />
+
+      {/* Comments 和 Recommendations 并行流式加载 */}
+      <Suspense fallback={<CommentsSkeleton />}>
+        <Comments postId={post.id} />    {/* 内部有 async 数据获取 */}
+      </Suspense>
+
+      <Suspense fallback={<RecommendationsSkeleton />}>
+        <Recommendations tags={post.tags} />
+      </Suspense>
+    </article>
+  );
+}
+
+// Comments：独立获取数据，就绪后流式插入 HTML
+async function Comments({ postId }: { postId: string }) {
+  const comments = await db.comments.findMany({ where: { postId } });
+  return (
+    <ul>
+      {comments.map((c) => <li key={c.id}>{c.content}</li>)}
+    </ul>
+  );
+}
+```
+
+**loading.tsx 是 Suspense 的语法糖：**
+
+```tsx
+// app/dashboard/loading.tsx
+// 等同于将整个 page.tsx 包裹在 <Suspense fallback={<Loading />}> 中
+export default function Loading() {
+  return <DashboardSkeleton />;
+}
+```
+
+### 3. PPR（Partial Prerendering）— Next.js 15 实验性
+
+PPR 将同一路由拆分为**静态壳 + 动态洞**，结合 SSG 速度和 SSR 灵活性：
+
+```tsx
+// next.config.ts
+export default {
+  experimental: {
+    ppr: true,
+  },
+};
+
+// app/product/[id]/page.tsx
+import { Suspense } from 'react';
+
+export default async function ProductPage({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+
+  return (
+    <div>
+      {/* 静态部分：构建时预渲染进 HTML */}
+      <ProductLayout>
+        <StaticProductInfo id={id} />
+
+        {/* 动态部分：运行时填充（不影响静态壳的 TTFB）*/}
+        <Suspense fallback={<PriceSkeleton />}>
+          <DynamicPrice id={id} />  {/* 内部用了 cookies() 获取用户货币 */}
+        </Suspense>
+
+        <Suspense fallback={<StockSkeleton />}>
+          <RealtimeStock id={id} />  {/* 实时库存，cache: 'no-store' */}
+        </Suspense>
+      </ProductLayout>
+    </div>
+  );
+}
+
+// PPR 原理：
+// 构建时：渲染静态壳（ProductLayout + StaticProductInfo），存储 HTML
+// 请求时：立即发送静态壳（<10ms），Suspense 内容异步填充
+```
+
+### 4. Server Actions
+
+Server Actions 是**在服务端执行的函数**，可直接从客户端调用，无需手写 API：
+
+```tsx
+// 原理：Next.js 自动创建 POST 端点，客户端调用时序列化参数发送
+
+// app/actions.ts（服务端 action 文件）
+'use server';
+
+import { revalidatePath } from 'next/cache';
+import { redirect } from 'next/navigation';
+
+export async function createPost(formData: FormData) {
+  // 直接访问数据库（服务端运行）
+  const title = formData.get('title') as string;
+  const content = formData.get('content') as string;
+
+  // 验证
+  if (!title || title.length < 3) {
+    return { error: '标题至少3个字符' };
+  }
+
+  const post = await db.posts.create({
+    data: { title, content, authorId: getCurrentUserId() },
+  });
+
+  revalidatePath('/posts');
+  redirect(`/posts/${post.id}`);
+}
+
+// 在 Server Component 中直接使用（表单 action）
+export default function NewPostPage() {
+  return (
+    <form action={createPost}>
+      <input name="title" />
+      <textarea name="content" />
+      <button type="submit">发布</button>
+    </form>
+  );
+}
+
+// 在 Client Component 中使用（配合 useActionState）
+'use client';
+import { useActionState } from 'react';
+import { createPost } from './actions';
+
+export function PostForm() {
+  const [state, action, isPending] = useActionState(createPost, null);
+
+  return (
+    <form action={action}>
+      <input name="title" />
+      <textarea name="content" />
+      {state?.error && <p className="text-red-500">{state.error}</p>}
+      <button disabled={isPending}>
+        {isPending ? '提交中...' : '发布'}
+      </button>
+    </form>
+  );
+}
+```
+
+**Server Actions 安全机制：**
+
+```tsx
+// Next.js 自动为每个 Server Action 生成加密 ID
+// 客户端调用时发送：POST /_next/action，body 包含 actionId + 序列化参数
+// 服务端验证 actionId 合法性，防止 CSRF
+
+// 仍然需要手动做的安全措施：
+async function deletePost(id: string) {
+  'use server';
+
+  // ✅ 验证用户身份（Action 内部无法自动获知调用者）
+  const session = await getSession();
+  if (!session?.userId) {
+    throw new Error('未授权');
+  }
+
+  // ✅ 验证权限（资源归属）
+  const post = await db.posts.findUnique({ where: { id } });
+  if (post?.authorId !== session.userId) {
+    throw new Error('无权删除他人文章');
+  }
+
+  await db.posts.delete({ where: { id } });
+  revalidatePath('/posts');
+}
+```
+
+### 5. Image 组件优化原理
+
+```tsx
+import Image from 'next/image';
+
+// ❌ 原生 <img>：无优化
+<img src="/hero.jpg" alt="Hero" />
+
+// ✅ next/image：自动优化
+<Image
+  src="/hero.jpg"
+  alt="Hero"
+  width={1200}
+  height={600}
+  priority           // LCP 图片：预加载，不懒加载
+  quality={85}       // 默认 75，平衡质量与体积
+  placeholder="blur" // 模糊占位（需提供 blurDataURL 或 static import）
+/>
+```
+
+**next/image 做了什么：**
+
+```text
+原始图片：hero.jpg（2MB，JPEG，2400×1200）
+
+next/image 处理：
+  1. 格式转换：JPEG → WebP/AVIF（体积减少 30~50%）
+  2. 尺寸响应：根据设备像素比 + 视口生成多份：
+     320w → hero_320.webp（50KB）
+     640w → hero_640.webp（180KB）
+     1200w → hero_1200.webp（350KB）
+  3. 懒加载：默认 loading="lazy"，仅视口内图片加载
+  4. CLS 防抖：通过 width/height 预留空间，避免布局偏移
+  5. 缓存：优化后图片缓存在 .next/cache/images/
+```
+
+```tsx
+// 动态 src（外部域名需要配置）
+// next.config.ts
+export default {
+  images: {
+    remotePatterns: [
+      {
+        protocol: 'https',
+        hostname: 'cdn.example.com',
+        pathname: '/images/**',
+      },
+    ],
+  },
+};
+
+// fill 模式：填充父容器（不需要固定 width/height）
+<div className="relative h-64 w-full">
+  <Image
+    src="/banner.jpg"
+    alt="Banner"
+    fill
+    sizes="(max-width: 768px) 100vw, 50vw"  // 告诉浏览器不同断点下的渲染宽度
+    className="object-cover"
+  />
+</div>
+```
+
+### 6. Font 优化
+
+```tsx
+// next/font 原理：
+// 1. 构建时下载字体文件
+// 2. 自动 self-hosting（不依赖 Google CDN）
+// 3. 自动生成 font-display: swap
+// 4. 字体文件与 HTML 同域，消除外部 DNS 查询
+
+import { Inter, Noto_Sans_SC } from 'next/font/google';
+
+const inter = Inter({
+  subsets: ['latin'],
+  variable: '--font-inter',   // CSS 变量
+  display: 'swap',
+});
+
+const notoSansSC = Noto_Sans_SC({
+  subsets: ['chinese-simplified'],
+  weight: ['400', '700'],
+  variable: '--font-noto',
+});
+
+// app/layout.tsx
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="zh" className={`${inter.variable} ${notoSansSC.variable}`}>
+      <body className="font-sans">{children}</body>
+    </html>
+  );
+}
+```
+
+## 深入追问
+
+### 如何判断当前路由是否是动态渲染？
+
+```bash
+# 运行 next build，输出日志中查看符号：
+Route (app)                              Size     First Load JS
+┌ ○ /                                    5.2 kB         92.5 kB
+├ ○ /about                               1.2 kB         88.5 kB
+├ ● /blog                                3.1 kB         90.4 kB   ← ISR
+├ ● /blog/[slug]                         2.8 kB         90.1 kB   ← ISR
+└ λ /dashboard                           4.5 kB         91.8 kB   ← 动态 SSR
+
+○  Static（静态，进入 Full Route Cache）
+●  ISR（增量静态再生，有 revalidate）
+λ  Dynamic（动态，每次服务端渲染）
+```
+
+### Server Actions vs Route Handlers 如何选择？
+
+```text
+Server Actions：
+  ✓ 表单提交、数据变更操作
+  ✓ 可直接在 Server/Client Component 中调用
+  ✓ 与 revalidatePath/redirect 无缝集成
+  ✗ 只支持 POST，不适合 GET 接口
+
+Route Handlers（app/api/route.ts）：
+  ✓ 需要支持多种 HTTP 方法（GET/POST/PUT/DELETE）
+  ✓ 需要被第三方（webhook、移动端、其他服务）调用
+  ✓ 需要自定义响应头（Content-Type、缓存头）
+  ✗ 每次需要手动 fetch，不如 Action 方便
+
+原则：纯前端内部调用优先 Server Actions；对外暴露 API 用 Route Handlers
+```

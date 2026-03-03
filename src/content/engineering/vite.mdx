@@ -1,94 +1,366 @@
 ---
-title: "Vite 原理与构建优化"
-description: "Vite 核心原理、HMR 机制、Rollup 插件、性能优化策略"
+title: "Vite 原理深度解析"
+description: "开发服务器架构、依赖预构建、HMR 原理、插件系统、构建优化策略"
 difficulty: "高级"
-tags: ["Vite", "ESM", "HMR", "Rollup", "构建优化"]
+tags: ["Vite", "ESM", "HMR", "esbuild", "Rollup", "插件", "构建优化"]
 category: "engineering"
 order: 1
 ---
 
-## 核心概念
+## 为什么 Vite 这么快？
 
-Vite 是新一代前端构建工具，开发环境基于原生 ESM，生产环境使用 Rollup 打包。
+Webpack 慢的根本原因：启动时必须从入口**递归分析所有依赖**，打成一个 bundle 才能启动 DevServer。
 
-### Vite vs Webpack
+Vite 的思路完全不同：
 
-| 特性 | Vite | Webpack |
-|------|------|---------|
-| 开发启动 | 即时启动（按需编译） | 全量打包 |
-| HMR 速度 | O(1) 与模块数无关 | O(n) 随模块增多变慢 |
-| 构建工具 | Rollup | 自有 |
-| 模块格式 | ESM | CommonJS/ESM |
+```text
+Webpack 开发模式：
+  入口 → 分析所有依赖 → 编译转换 → 打 bundle → DevServer 启动
+  项目越大，启动越慢（几十秒甚至更久）
+
+Vite 开发模式：
+  DevServer 立即启动（<300ms）
+  浏览器请求 /src/main.ts
+    → Vite 按需编译这一个文件
+    → 浏览器解析 import，发现依赖
+    → 再次请求依赖文件
+    → Vite 按需编译...
+  首屏加载慢一点，但启动是即时的
+```
 
 ## 高频面试题
 
-### 1. Vite 为什么快？
+### 1. 依赖预构建（Pre-bundling）
 
-**开发环境：**
-- 利用浏览器原生 ESM，无需打包
-- 按需编译：只编译当前请求的模块
-- 预构建（esbuild）：将 CommonJS/UMD 转为 ESM，合并小模块
+Vite 启动时用 **esbuild** 对 `node_modules` 做一次预构建，原因：
 
-```javascript
-// 浏览器直接请求模块
-import { createApp } from '/node_modules/.vite/deps/vue.js'
-import App from '/src/App.vue?t=1234567890'
+```text
+问题1：CJS/UMD → ESM 转换
+  大多数 npm 包仍是 CommonJS，浏览器原生 ESM 不能直接 import
+  esbuild 将它们转为 ESM（速度比 Babel/tsc 快 10~100 倍）
+
+问题2：减少网络请求
+  lodash-es 有 600+ 个模块文件
+  浏览器逐个请求 → 瀑布式请求链 → 首屏极慢
+  esbuild 将 lodash-es 合并成一个文件 → 1次请求搞定
+
+问题3：缓存优化
+  预构建结果缓存在 node_modules/.vite/deps/
+  文件 hash 不变则直接复用，项目重启也不重新构建
 ```
 
-**生产环境：**
-- 使用 Rollup 打包（Tree Shaking 更好）
-- 代码分割和动态导入
+```javascript
+// 预构建后，浏览器实际请求的是：
+import { debounce } from '/node_modules/.vite/deps/lodash-es.js'
+// 而不是 600+ 个单独文件
 
-### 2. HMR（热模块替换）原理
+// vite.config.ts：手动控制预构建
+export default defineConfig({
+  optimizeDeps: {
+    include: ['some-cjs-lib'],   // 强制预构建（Vite 未自动检测到的）
+    exclude: ['my-local-pkg'],   // 排除不需要预构建的包
+    esbuildOptions: {
+      plugins: [/* esbuild 插件 */],
+    },
+  },
+});
+```
+
+### 2. 开发服务器：请求拦截管道
+
+Vite DevServer 本质是一个 **Connect** 中间件链，每次请求走过一系列 transform：
+
+```text
+浏览器请求 /src/App.vue
+         ↓
+┌─────────────────────────────────┐
+│  Vite 中间件链                   │
+│  1. 静态资源中间件               │
+│  2. 路径解析（@/ 别名等）         │
+│  3. 插件 transform 钩子          │
+│     └── @vitejs/plugin-vue       │
+│         .vue → JS + CSS          │
+│  4. TypeScript → JS（esbuild）   │
+│  5. 注入 HMR 客户端代码          │
+└─────────────────────────────────┘
+         ↓
+浏览器收到转换后的 JS
+```
 
 ```javascript
-// Vite HMR API
+// Vite 内部对 .vue 文件的处理（简化）
+// 请求 /src/App.vue?vue&type=template 时
+
+// 1. 读取文件
+const fileContent = fs.readFileSync('/src/App.vue', 'utf-8');
+
+// 2. 用 @vue/compiler-sfc 解析 SFC
+const { descriptor } = parse(fileContent);
+
+// 3. 分别编译各块
+const templateCode = compileTemplate(descriptor.template);
+const scriptCode = compileScript(descriptor.scriptSetup);
+
+// 4. 注入 HMR 逻辑
+const hmrCode = `
+  import.meta.hot.accept(({ default: updated }) => {
+    __vccOpts.__hmrId = '${hash}';
+    updateComponent(updated);
+  });
+`;
+
+// 5. 返回给浏览器
+return templateCode + scriptCode + hmrCode;
+```
+
+### 3. HMR 原理：O(1) 更新速度
+
+```text
+Webpack HMR：                    Vite HMR：
+需要重新构建整个 module graph      只需重新请求变更的文件
+
+文件改变                          文件改变
+  ↓                                  ↓
+重新分析依赖                      找到最近的 HMR 边界
+  ↓                                  ↓
+重新打包受影响的 chunk             WebSocket 发消息给浏览器
+  ↓                                  ↓（毫秒级）
+通知浏览器更新                    浏览器重新 fetch 变更模块
+  ↓（可能数秒）                       ↓
+更新完成                          执行 accept 回调，更新完成
+```
+
+```javascript
+// Vite HMR 客户端 API（在源码中使用）
+
+// React 组件：@vitejs/plugin-react 自动注入，无需手写
+// Vue 组件：@vitejs/plugin-vue 自动注入
+
+// 手动处理 HMR（用于自定义场景）
 if (import.meta.hot) {
-  import.meta.hot.accept('./module.js', (newModule) => {
-    // 模块更新后的处理
+  // 接受自身更新
+  import.meta.hot.accept((newModule) => {
+    // 用新模块替换旧逻辑
+    if (newModule) {
+      newModule.setup();
+    }
   });
 
-  import.meta.hot.dispose(() => {
-    // 清理副作用
+  // 接受依赖更新
+  import.meta.hot.accept('./store.js', (newStore) => {
+    replaceStore(newStore);
   });
+
+  // 清理副作用（在模块被替换前执行）
+  import.meta.hot.dispose((data) => {
+    clearInterval(timer);
+    data.someState = currentState; // 传递状态给新模块
+  });
+
+  // 接收上一个模块传来的状态
+  const previousState = import.meta.hot.data.someState;
 }
 ```
 
-Vite HMR 流程：
-1. 文件变更 → Vite Server 检测
-2. 计算 HMR 边界（最近的 `accept` 模块）
-3. WebSocket 通知浏览器
-4. 浏览器重新请求变更模块
-5. 执行更新回调
+### 4. 插件系统：兼容 Rollup 的钩子体系
 
-### 3. 依赖预构建
-
-Vite 使用 esbuild 对 `node_modules` 进行预构建：
-
-- 将 CommonJS/UMD 转为 ESM
-- 合并众多小文件（如 lodash-es 有 600+ 模块）
-- 缓存到 `node_modules/.vite`
-
-## 深入追问
-
-### Tree Shaking 的原理
-
-Tree Shaking 基于 ESM 的静态结构分析：
-- `import/export` 是静态声明，编译时可确定依赖关系
-- 标记未使用的导出
-- 压缩阶段删除未引用代码
-- `sideEffects: false` 告诉打包器模块无副作用
-
-### Rollup 插件机制
+Vite 插件是 Rollup 插件的超集，在 Rollup 钩子基础上新增了 Vite 专属钩子：
 
 ```javascript
-// Vite 插件示例
-export default function myPlugin() {
+// 插件执行时机与钩子分类
+export default function myPlugin(): Plugin {
   return {
     name: 'my-plugin',
-    resolveId(source) { /* 解析模块路径 */ },
-    load(id) { /* 加载模块内容 */ },
-    transform(code, id) { /* 转换模块代码 */ },
+
+    // ── 构建阶段（Rollup 兼容钩子）──────────────────────────
+
+    // 解析模块路径（import 'xxx' 中的 'xxx'）
+    resolveId(source, importer) {
+      if (source === 'virtual:my-module') {
+        return '\0virtual:my-module'; // \0 前缀表示虚拟模块
+      }
+    },
+
+    // 加载模块内容
+    load(id) {
+      if (id === '\0virtual:my-module') {
+        return `export const msg = 'Hello from virtual module'`;
+      }
+    },
+
+    // 转换模块代码
+    transform(code, id) {
+      if (id.endsWith('.txt')) {
+        return {
+          code: `export default ${JSON.stringify(code)}`,
+          map: null,
+        };
+      }
+    },
+
+    // ── Vite 专属钩子 ─────────────────────────────────────
+
+    // Vite 配置解析后调用（可修改/扩展配置）
+    configResolved(config) {
+      console.log('build mode:', config.mode);
+    },
+
+    // 开发服务器创建后调用（可添加自定义中间件）
+    configureServer(server) {
+      server.middlewares.use('/my-endpoint', (req, res) => {
+        res.end('custom response');
+      });
+    },
+
+    // HTML 转换（注入脚本/样式）
+    transformIndexHtml(html) {
+      return html.replace(
+        '<head>',
+        `<head><meta name="build-time" content="${Date.now()}">`
+      );
+    },
+
+    // 文件变动时调用（HMR 触发前）
+    handleHotUpdate({ file, server, modules }) {
+      if (file.endsWith('.data')) {
+        // 自定义 HMR 逻辑
+        server.ws.send({ type: 'custom', event: 'data-update' });
+        return []; // 阻止默认 HMR
+      }
+    },
   };
 }
+```
+
+**插件执行顺序：**
+
+```javascript
+// vite.config.ts
+export default defineConfig({
+  plugins: [
+    // enforce: 'pre' → 在 Vite 核心插件之前执行
+    { name: 'pre-plugin', enforce: 'pre', transform() {} },
+
+    // 默认 → 在 Vite 核心插件之后执行
+    vue(),
+    react(),
+
+    // enforce: 'post' → 在构建插件之后执行（如 minification 之前）
+    { name: 'post-plugin', enforce: 'post', transform() {} },
+  ],
+});
+```
+
+### 5. 生产构建：Rollup + 代码分割
+
+```javascript
+// vite.config.ts：生产构建优化
+export default defineConfig({
+  build: {
+    // 手动分 chunk（避免 vendor 包被重复打包）
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          // 将 React 相关库单独打成一个 chunk
+          'vendor-react': ['react', 'react-dom', 'react-router-dom'],
+          // 将工具库单独打包
+          'vendor-utils': ['lodash-es', 'dayjs', 'axios'],
+        },
+        // 或者用函数动态分割
+        manualChunks(id) {
+          if (id.includes('node_modules')) {
+            // 每个依赖单独打包（适合 HTTP/2 场景）
+            return id.toString().split('node_modules/')[1].split('/')[0];
+          }
+        },
+      },
+    },
+
+    // chunk 大小警告阈值（kb）
+    chunkSizeWarningLimit: 500,
+
+    // 生成 sourcemap（生产环境调试用）
+    sourcemap: true,
+
+    // CSS 代码分割（每个 async chunk 单独 CSS）
+    cssCodeSplit: true,
+
+    // 构建目标（影响语法转换程度）
+    target: 'es2015',
+
+    // 压缩器
+    minify: 'esbuild', // 'esbuild'（快）| 'terser'（压缩率更高）
+  },
+});
+```
+
+### 6. Tree Shaking 深度原理
+
+```javascript
+// Tree Shaking 基于 ESM 的静态分析——编译时确定导入导出关系
+
+// ✅ ESM：静态，可分析
+import { debounce } from 'lodash-es';  // 只打包 debounce
+// ❌ CJS：动态，无法分析
+const { debounce } = require('lodash'); // 整个 lodash 都打包进去
+
+// sideEffects 配置告诉打包器模块是否有副作用
+// package.json
+{
+  "sideEffects": false,                    // 整个包无副作用，可以安全删除未用代码
+  "sideEffects": ["*.css", "*.scss"],     // CSS 文件有副作用（不能删），JS 可以
+}
+
+// vite.config.ts 中标记副作用
+export default defineConfig({
+  build: {
+    rollupOptions: {
+      // 告诉 Rollup 这些模块没有副作用
+      treeshake: {
+        moduleSideEffects: false,
+      },
+    },
+  },
+});
+
+// 常见 Tree Shaking 失效场景：
+// ❌ 1. 使用 CJS require
+const utils = require('./utils'); // 整个 utils 打包
+
+// ❌ 2. 动态导入键名
+import * as utils from './utils';
+const fn = utils[key](); // 无法静态分析，全部保留
+
+// ❌ 3. 有副作用的模块（import 时执行代码）
+import './polyfill'; // 执行了代码，不能删除
+
+// ✅ 4. 正确：具名 import
+import { formatDate } from './utils'; // 只打包 formatDate
+```
+
+## 进阶追问
+
+### Vite 与 Webpack 在生产环境的选择
+
+```text
+Vite（Rollup）适合：
+  ✓ 库/组件库开发（ESM output 更纯净）
+  ✓ 现代浏览器目标（ES2015+）
+  ✓ 中小型应用（大型复杂应用 Rollup 配置不如 Webpack 灵活）
+
+Webpack 适合：
+  ✓ 超大型复杂应用（Module Federation 微前端）
+  ✓ 需要大量自定义 loader（如特殊文件类型处理）
+  ✓ 需要精细控制 bundle 结构
+  ✓ 兼容旧浏览器（CommonJS/AMD 场景）
+  ✓ 企业已有 Webpack 生态积累
+```
+
+### Vite 的局限性
+
+```text
+1. SSR 支持：相比 Webpack，Vite 的 SSR 模式更复杂（模块 externalize 问题）
+2. 大型项目冷启动：node_modules 预构建时间随依赖增多而增加
+3. 生产 vs 开发不一致：dev 用 ESM，prod 用 Rollup，行为可能有差异
+4. CJS 依赖：复杂的 CJS 包有时预构建后行为异常
 ```

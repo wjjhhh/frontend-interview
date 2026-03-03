@@ -1,0 +1,266 @@
+---
+title: "AI Agent 核心概念与架构"
+description: "什么是 AI Agent、核心组成要素、ReAct 框架、常见 Agent 架构模式"
+difficulty: "高级"
+tags: ["AI Agent", "LLM", "Tool Calling", "ReAct", "RAG", "规划", "记忆"]
+category: "ai-agent"
+order: 1
+---
+
+## 什么是 AI Agent？
+
+AI Agent 是以大语言模型（LLM）为"大脑"，能够**感知环境、制定计划、调用工具、自主执行任务**的自动化系统。
+
+与普通 LLM 调用的本质区别：
+
+```text
+普通 LLM 调用（单轮）：
+  用户输入 → LLM → 文本输出
+  特点：被动响应，无记忆，无行动能力
+
+AI Agent（多轮 + 工具）：
+  目标输入
+    → LLM 思考并拆解任务
+    → 选择工具执行（搜索、写代码、调 API...）
+    → 观察结果，继续推理
+    → 循环直到完成目标
+  特点：主动规划，有记忆，能与外部世界交互
+```
+
+## 高频面试题
+
+### 1. Agent 的四大核心组件
+
+```text
+┌─────────────────────────────────────────────────────────┐
+│                      AI Agent                           │
+│                                                         │
+│  ┌─────────────┐   ┌─────────────┐   ┌──────────────┐  │
+│  │  LLM 核心   │   │   工具层     │   │    记忆层     │  │
+│  │             │   │             │   │              │  │
+│  │ 推理 / 规划  │◄──► 搜索引擎    │   │ 短期记忆      │  │
+│  │ 理解意图    │   │ 代码执行器  │   │ (对话上下文) │  │
+│  │ 生成动作    │   │ 数据库查询  │   │              │  │
+│  │             │   │ 外部 API    │   │ 长期记忆      │  │
+│  └─────────────┘   │ 文件操作    │   │ (向量数据库) │  │
+│                    └─────────────┘   └──────────────┘  │
+│                                                         │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │                    规划层                         │  │
+│  │  任务分解 / 子目标生成 / 反思与纠错                  │  │
+│  └──────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
+```
+
+**① LLM（推理核心）**：负责理解任务、生成行动计划、解释工具调用结果
+
+**② 工具（Tools）**：LLM 调用外部能力的接口，赋予 Agent 行动能力
+
+**③ 记忆（Memory）**：
+- 短期记忆：当前会话上下文（放在 prompt 的 messages 中）
+- 长期记忆：通过向量数据库持久化，按语义相似度召回
+
+**④ 规划（Planning）**：将复杂目标拆解为子任务，支持多步骤执行和自我纠错
+
+---
+
+### 2. ReAct 框架：Agent 的思考-行动循环
+
+ReAct（Reasoning + Acting）是目前最主流的 Agent 执行模式：
+
+```text
+Thought: 我需要查找今天的天气，然后推荐穿着
+Action: search_weather(city="上海")
+Observation: 上海今天最高气温 32°C，晴天，湿度 70%
+
+Thought: 天气炎热，应该推荐轻薄透气的衣物
+Action: finish(answer="建议穿短袖、薄棉裤，携带遮阳帽和防晒霜")
+```
+
+```javascript
+// ReAct 的简化实现逻辑
+async function reactAgent(goal, tools) {
+  const messages = [{ role: 'user', content: goal }];
+
+  while (true) {
+    // LLM 推理：决定下一步行动
+    const response = await llm.chat(messages, { tools });
+
+    // 如果 LLM 选择调用工具
+    if (response.tool_calls) {
+      for (const toolCall of response.tool_calls) {
+        // 执行工具
+        const result = await tools[toolCall.name](toolCall.args);
+
+        // 将工具结果反馈给 LLM（Observation）
+        messages.push({ role: 'tool', content: result, tool_call_id: toolCall.id });
+      }
+    } else {
+      // LLM 认为任务完成，返回最终答案
+      return response.content;
+    }
+  }
+}
+```
+
+---
+
+### 3. 常见 Agent 架构模式
+
+#### 单 Agent（Simple Agent）
+
+```text
+用户 → Agent → 工具集合
+适用：任务边界清晰、工具数量少
+例子：代码助手、SQL 生成器
+```
+
+#### 多 Agent（Multi-Agent）
+
+```text
+用户 → 编排者（Orchestrator）
+           ├─► 研究 Agent（专门搜索）
+           ├─► 代码 Agent（专门写代码）
+           └─► 评审 Agent（检查质量）
+
+优势：职责分离，每个 Agent 专注擅长的任务
+例子：复杂报告生成、软件开发自动化
+```
+
+#### 管道模式（Pipeline）
+
+```text
+数据 → Agent A（提取）→ Agent B（分析）→ Agent C（生成报告）
+
+特点：线性流程，前一步输出是后一步输入
+适用：数据处理流水线、内容生产管道
+```
+
+#### 反思模式（Reflection）
+
+```javascript
+// Agent 会对自己的输出进行反思和改进
+async function reflectionAgent(task) {
+  // 第一步：生成初稿
+  let draft = await generate(task);
+
+  // 第二步：自我评审（或让另一个 LLM 评审）
+  const feedback = await critique(draft);
+
+  // 第三步：根据反馈改进
+  const improved = await revise(draft, feedback);
+
+  return improved;
+}
+```
+
+---
+
+### 4. RAG（检索增强生成）
+
+RAG 解决 LLM 知识截止和私有数据问题：
+
+```text
+RAG 架构：
+
+离线阶段（构建知识库）：
+  文档 → 切片（Chunking）→ 向量化（Embedding）→ 存入向量数据库
+
+在线阶段（回答问题）：
+  用户问题
+    → 向量化问题
+    → 向量数据库相似度检索（Top-K 相关片段）
+    → 将检索结果 + 问题 组合成 Prompt
+    → LLM 生成答案（有据可依）
+```
+
+```javascript
+// RAG 基本实现
+async function ragQuery(question) {
+  // 1. 将问题向量化
+  const questionEmbedding = await embeddings.embed(question);
+
+  // 2. 从向量数据库检索最相关的文档片段
+  const relevantDocs = await vectorDB.similaritySearch(questionEmbedding, { topK: 5 });
+
+  // 3. 组合 Prompt
+  const context = relevantDocs.map(doc => doc.content).join('\n\n');
+  const prompt = `
+    基于以下参考资料回答问题：
+    ${context}
+
+    问题：${question}
+    请只根据参考资料作答，如果资料中没有相关信息，请说"我不知道"。
+  `;
+
+  // 4. LLM 生成答案
+  return await llm.complete(prompt);
+}
+```
+
+**关键参数：**
+
+```text
+Chunk Size（切片大小）：
+  太大 → 检索结果包含无关内容，噪音多
+  太小 → 缺少上下文，信息不完整
+  推荐：512~1024 tokens，带 overlap（如 128 tokens 重叠）
+
+Top-K（检索数量）：
+  太少 → 可能遗漏关键信息
+  太多 → 超出 context window，成本高
+  推荐：3~10，根据任务复杂度调整
+```
+
+---
+
+### 5. Context Window 管理
+
+LLM 的上下文窗口有限（如 Claude 200K tokens），长对话需要主动管理：
+
+```javascript
+// 策略 1：滑动窗口（保留最近 N 条消息）
+function trimMessages(messages, maxTokens) {
+  // 始终保留 system prompt
+  const system = messages.filter(m => m.role === 'system');
+  const history = messages.filter(m => m.role !== 'system');
+
+  // 从最新消息往前保留，直到接近 token 上限
+  let tokens = countTokens(system);
+  const kept = [];
+  for (let i = history.length - 1; i >= 0; i--) {
+    tokens += countTokens([history[i]]);
+    if (tokens > maxTokens) break;
+    kept.unshift(history[i]);
+  }
+
+  return [...system, ...kept];
+}
+
+// 策略 2：摘要压缩（超出后让 LLM 总结历史）
+async function summarizeHistory(oldMessages) {
+  const summary = await llm.complete(
+    `请将以下对话历史总结为简短摘要：\n${JSON.stringify(oldMessages)}`
+  );
+  return [{ role: 'system', content: `对话历史摘要：${summary}` }];
+}
+```
+
+---
+
+### 6. Agent 可靠性挑战
+
+```text
+常见问题：
+  1. 幻觉（Hallucination）：LLM 编造不存在的工具参数或信息
+  2. 无限循环：Agent 在某个子任务上反复尝试失败
+  3. 工具滥用：选错工具或参数格式错误
+  4. 成本失控：多轮对话 + 大量工具调用 → Token 消耗飙升
+
+应对策略：
+  ✅ 设置最大步骤数（max_iterations）防止无限循环
+  ✅ 工具参数用 JSON Schema 约束并做运行时校验
+  ✅ 关键操作加入人工确认（Human-in-the-Loop）
+  ✅ 输出结果做事实性检验（二次验证）
+  ✅ 设置费用预算上限（max_tokens per session）
+```

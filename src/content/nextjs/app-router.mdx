@@ -1,0 +1,354 @@
+---
+title: "Next.js App Router 核心原理"
+description: "App Router vs Pages Router、路由约定、布局嵌套、并行路由、拦截路由、Server/Client 边界"
+difficulty: "高级"
+tags: ["App Router", "布局", "并行路由", "拦截路由", "Server Components"]
+category: "nextjs"
+order: 1
+---
+
+## App Router vs Pages Router
+
+```text
+Pages Router（Next.js 12 及之前）      App Router（Next.js 13.4+，推荐）
+─────────────────────────────────      ──────────────────────────────────
+pages/
+  index.tsx          → /              app/
+  about.tsx          → /about           page.tsx        → /
+  blog/                                 about/
+    [slug].tsx       → /blog/:slug        page.tsx      → /about
+                                        blog/
+                                          [slug]/
+                                            page.tsx    → /blog/:slug
+
+- 所有组件默认是客户端组件              - 所有组件默认是 Server Component
+- getServerSideProps/getStaticProps     - 直接在组件内 async/await 获取数据
+- _app.tsx 全局布局                     - layout.tsx 嵌套布局
+- 无原生并行路由/拦截路由               - 支持 @slot 并行路由、(.) 拦截路由
+```
+
+**主要优势：**
+
+| 特性 | Pages Router | App Router |
+|------|-------------|-----------|
+| 默认组件类型 | 客户端 | 服务端（零 JS bundle）|
+| 数据获取 | getServerSideProps / getStaticProps | 直接 async/await |
+| 布局嵌套 | 手动组合 | 文件系统自动嵌套 |
+| 流式渲染 | 不支持 | Suspense + streaming |
+| Server Actions | 不支持 | 原生支持 |
+
+## 高频面试题
+
+### 1. App Router 文件约定
+
+```text
+app/
+├── layout.tsx          ← 根布局（必须，包含 <html><body>）
+├── page.tsx            ← 路由页面（/）
+├── loading.tsx         ← Suspense 自动包裹的加载 UI
+├── error.tsx           ← Error Boundary（"use client"）
+├── not-found.tsx       ← 404 页面
+├── template.tsx        ← 类似 layout，但每次导航重新挂载
+├── route.ts            ← API Route Handler
+│
+├── (marketing)/        ← 路由组（不影响 URL）
+│   ├── layout.tsx      ← 仅 marketing 路由的布局
+│   ├── page.tsx        ← /
+│   └── about/
+│       └── page.tsx    ← /about
+│
+├── dashboard/
+│   ├── layout.tsx      ← dashboard 嵌套布局
+│   ├── page.tsx        ← /dashboard
+│   └── settings/
+│       └── page.tsx    ← /dashboard/settings
+│
+└── blog/
+    └── [slug]/
+        └── page.tsx    ← /blog/:slug（动态段）
+```
+
+### 2. 布局嵌套与 Template 的区别
+
+```tsx
+// layout.tsx：跨导航保持状态，不重新挂载
+// 适合：导航栏、侧边栏、需要保留 state 的 UI
+export default function DashboardLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="flex">
+      <Sidebar />        {/* 导航不重新挂载，状态保留 */}
+      <main>{children}</main>
+    </div>
+  );
+}
+
+// template.tsx：每次导航创建新实例，重新挂载
+// 适合：每次进入需要记录浏览、动画需要每次触发
+export default function Template({ children }: { children: React.ReactNode }) {
+  return <div className="animate-fadeIn">{children}</div>;
+  // 每次路由切换，这个 div 都会重新挂载（动画每次触发）
+}
+```
+
+### 3. Server Component vs Client Component 边界
+
+```text
+Server Component（默认）           Client Component（'use client'）
+─────────────────────────          ─────────────────────────────────
+✅ 直接访问数据库/文件系统          ✅ useState / useEffect / Hooks
+✅ 不暴露 API 密钥（不打包到客户端）✅ 事件处理（onClick 等）
+✅ 减少客户端 JS bundle             ✅ 访问浏览器 API（window/document）
+❌ 不能用 Hooks                     ❌ 不能直接访问数据库
+❌ 不能绑定事件                     ❌ 需要序列化跨边界传递的 props
+
+组件树中的传播规则：
+  ServerComponent
+    ├── ServerComponent（默认，继续在服务端）
+    ├── ClientComponent（'use client'）
+    │     └── ServerComponent ❌（一旦进入客户端边界，子组件也默认是客户端）
+    └── ClientComponent（传入 children prop）
+          └── {children}  ✅ children 可以是 Server Component（通过 props 传递）
+```
+
+```tsx
+// ✅ 正确：Server Component 作为 children 传入 Client Component
+// app/page.tsx（Server Component）
+import { ClientWrapper } from './ClientWrapper';
+import { ServerContent } from './ServerContent';
+
+export default function Page() {
+  return (
+    <ClientWrapper>
+      <ServerContent /> {/* 仍在服务端执行 ✅ */}
+    </ClientWrapper>
+  );
+}
+
+// ClientWrapper.tsx
+'use client';
+export function ClientWrapper({ children }: { children: React.ReactNode }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div>
+      <button onClick={() => setOpen(!open)}>Toggle</button>
+      {open && children}  {/* children 是从服务端传来的，不变成客户端组件 */}
+    </div>
+  );
+}
+```
+
+### 4. 并行路由（Parallel Routes）
+
+```text
+app/
+├── layout.tsx
+├── @team/
+│   └── page.tsx     ← slot: team
+├── @analytics/
+│   └── page.tsx     ← slot: analytics
+└── page.tsx
+```
+
+```tsx
+// layout.tsx：同时渲染多个独立路由页面
+export default function Layout({
+  children,
+  team,
+  analytics,
+}: {
+  children: React.ReactNode;
+  team: React.ReactNode;      // 对应 @team/page.tsx
+  analytics: React.ReactNode; // 对应 @analytics/page.tsx
+}) {
+  return (
+    <div className="grid grid-cols-3">
+      <main>{children}</main>
+      <aside>{team}</aside>
+      <aside>{analytics}</aside>
+    </div>
+  );
+}
+```
+
+**用途：**
+- 同一页面内展示多个独立加载的板块（各自有独立 loading/error）
+- Modal 模式：一个 slot 作为弹窗覆盖层，另一个显示背景页面
+
+### 5. 拦截路由（Intercepting Routes）
+
+```text
+约定：
+  (.)   拦截同级目录
+  (..)  拦截上一级
+  (..)(..) 拦截两级
+  (...) 拦截根目录
+
+app/
+├── feed/
+│   └── page.tsx          ← /feed（图片流）
+├── photo/
+│   └── [id]/
+│       └── page.tsx      ← /photo/123（完整照片页）
+└── @modal/
+    └── (.)photo/         ← 拦截 /photo/123
+        └── [id]/
+            └── page.tsx  ← 在 feed 页展示 Modal
+```
+
+```tsx
+// 效果：
+// 从 /feed 点击图片 → URL 变为 /photo/123，但页面显示 Modal（不跳转）
+// 直接访问 /photo/123 → 显示完整照片页
+
+// app/@modal/(.)photo/[id]/page.tsx
+export default function PhotoModal({ params }: { params: { id: string } }) {
+  return (
+    <Modal>
+      <Photo id={params.id} />
+    </Modal>
+  );
+}
+
+// app/photo/[id]/page.tsx（直接访问时的完整页面）
+export default function PhotoPage({ params }: { params: { id: string } }) {
+  return <Photo id={params.id} />;
+}
+```
+
+### 6. Route Handlers（API Routes）
+
+```tsx
+// app/api/users/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+
+export async function GET(request: NextRequest) {
+  const searchParams = request.nextUrl.searchParams;
+  const query = searchParams.get('q');
+
+  const users = await db.users.findMany({
+    where: query ? { name: { contains: query } } : undefined,
+  });
+
+  return NextResponse.json(users);
+}
+
+export async function POST(request: NextRequest) {
+  const body = await request.json();
+
+  // 验证
+  if (!body.name || !body.email) {
+    return NextResponse.json({ error: '缺少必填字段' }, { status: 400 });
+  }
+
+  const user = await db.users.create({ data: body });
+  return NextResponse.json(user, { status: 201 });
+}
+
+// 动态路由：app/api/users/[id]/route.ts
+export async function GET(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id } = await params;  // Next.js 15：params 是 Promise
+  const user = await db.users.findUnique({ where: { id } });
+  if (!user) return NextResponse.json({ error: 'Not Found' }, { status: 404 });
+  return NextResponse.json(user);
+}
+```
+
+### 7. Middleware：路由拦截与重写
+
+```tsx
+// middleware.ts（项目根目录）
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+
+export function middleware(request: NextRequest) {
+  const token = request.cookies.get('token')?.value;
+  const { pathname } = request.nextUrl;
+
+  // 保护 /dashboard 路由
+  if (pathname.startsWith('/dashboard') && !token) {
+    return NextResponse.redirect(new URL('/login', request.url));
+  }
+
+  // A/B 测试：随机路由重写（不改变 URL）
+  if (pathname === '/') {
+    const bucket = Math.random() > 0.5 ? 'a' : 'b';
+    return NextResponse.rewrite(new URL(`/home-${bucket}`, request.url));
+  }
+
+  // 国际化：根据 Accept-Language 重定向
+  if (pathname === '/') {
+    const lang = request.headers.get('Accept-Language')?.split(',')[0] ?? 'en';
+    return NextResponse.redirect(new URL(`/${lang}`, request.url));
+  }
+
+  return NextResponse.next();
+}
+
+// 指定 middleware 生效的路由（避免匹配静态资源）
+export const config = {
+  matcher: [
+    '/((?!_next/static|_next/image|favicon.ico).*)',
+  ],
+};
+```
+
+## 深入追问
+
+### layout.tsx 和 page.tsx 的渲染关系
+
+```text
+访问 /dashboard/settings 时，渲染顺序：
+
+app/layout.tsx          ← 最外层，包含 <html><body>
+  app/dashboard/
+    layout.tsx          ← 中间层，包含侧边栏
+      settings/
+        page.tsx        ← 实际页面内容
+
+最终 HTML 结构：
+<html>
+  <body>
+    <nav>根布局导航</nav>
+    <div>               ← dashboard layout
+      <Sidebar />
+      <main>
+        <h1>设置页面</h1>  ← settings page
+      </main>
+    </div>
+  </body>
+</html>
+```
+
+### Next.js 15 的 Breaking Changes
+
+```tsx
+// Next.js 15：params 和 searchParams 改为异步（Promise）
+
+// ❌ Next.js 14（同步）
+export default function Page({ params }: { params: { id: string } }) {
+  const { id } = params;
+}
+
+// ✅ Next.js 15（异步）
+export default async function Page({
+  params,
+  searchParams,
+}: {
+  params: Promise<{ id: string }>;
+  searchParams: Promise<{ q?: string }>;
+}) {
+  const { id } = await params;
+  const { q } = await searchParams;
+}
+
+// Route Handler 也同样
+export async function GET(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id } = await params;
+}
+```

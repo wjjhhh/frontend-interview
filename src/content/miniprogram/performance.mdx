@@ -1,0 +1,364 @@
+---
+title: "小程序性能优化与分包加载"
+description: "setData 优化策略、分包加载原理、预加载、虚拟列表、启动性能"
+difficulty: "高级"
+tags: ["小程序", "setData", "分包", "预加载", "虚拟列表", "性能优化", "启动优化"]
+category: "miniprogram"
+order: 2
+---
+
+## 性能瓶颈在哪里？
+
+小程序性能问题主要集中在两个方向：
+
+```text
+1. setData 滥用
+   逻辑层 → JSBridge → 渲染层 的通信开销
+   数据量大 + 频率高 → 主线程阻塞 → 页面卡顿
+
+2. 包体积过大
+   主包 > 2MB → 无法发布
+   首次启动下载慢 → 白屏时间长
+```
+
+## 高频面试题
+
+### 1. setData 的性能问题与优化
+
+#### 问题根源
+
+```javascript
+// ❌ 反面示例：在 scroll 事件中频繁 setData
+onPageScroll({ scrollTop }) {
+  this.setData({ scrollTop }); // 每次滚动都触发跨线程通信！
+}
+
+// ❌ 一次性传递大量无关数据
+this.setData({
+  ...整个列表数据（几百条）,  // 实际只改了一个字段
+});
+```
+
+#### 优化策略
+
+**① 只传必要的数据（精确路径更新）**
+
+```javascript
+// ❌ 重新设置整个列表
+this.setData({ list: newList });
+
+// ✅ 精确更新某一项
+this.setData({ [`list[${index}].liked`]: true });
+
+// ✅ 批量更新用对象合并（减少调用次数）
+this.setData({
+  'userInfo.name': '张三',
+  'userInfo.avatar': 'https://...',
+  count: 10,
+});
+```
+
+**② 防抖/节流高频事件**
+
+```javascript
+// ✅ 滚动等高频事件用节流
+onPageScroll: throttle(function({ scrollTop }) {
+  this.setData({ scrollTop });
+}, 100),
+
+// ✅ 搜索输入防抖
+onInput: debounce(function(e) {
+  this.setData({ keyword: e.detail.value });
+  this.search();
+}, 300),
+```
+
+**③ 将不影响渲染的数据存在 this 上**
+
+```javascript
+Page({
+  onLoad() {
+    // ✅ 纯逻辑数据不需要驱动渲染，直接挂在实例上
+    this._timer = null;
+    this._cache = {};
+    this._pageNum = 1;  // 分页页码，不展示在页面上
+
+    // ❌ 错误做法：凡是数据都放 data，导致 setData 数据量膨胀
+    // this.setData({ pageNum: 1 });
+  },
+});
+```
+
+**④ 后台页面停止 setData**
+
+```javascript
+Page({
+  onShow() { this._visible = true; },
+  onHide() { this._visible = false; },
+
+  updateData() {
+    if (!this._visible) return; // 页面不可见时跳过
+    this.setData({ ... });
+  },
+});
+```
+
+---
+
+### 2. 分包加载
+
+小程序**主包不能超过 2MB**，总包不能超过 20MB，分包是解决包大小限制的核心方案。
+
+#### 基础分包
+
+```json
+// app.json
+{
+  "pages": [
+    "pages/index/index",
+    "pages/user/user"
+  ],
+  "subPackages": [
+    {
+      "root": "packageA",
+      "name": "pkgA",
+      "pages": [
+        "pages/detail/detail",
+        "pages/order/order"
+      ]
+    },
+    {
+      "root": "packageB",
+      "pages": ["pages/video/video"]
+    }
+  ]
+}
+```
+
+```text
+加载规则：
+  - 启动时只下载主包
+  - 用户跳转到 packageA 页面时，才下载 packageA
+  - 各分包之间不能互相引用（可以引用主包的资源）
+  - 主包可以访问所有分包的资源（tabBar 页面必须在主包）
+```
+
+#### 独立分包
+
+```json
+{
+  "subPackages": [
+    {
+      "root": "packageC",
+      "pages": ["pages/activity/activity"],
+      "independent": true  // 独立分包
+    }
+  ]
+}
+```
+
+```text
+独立分包的特点：
+  ✅ 可以不依赖主包独立运行（分享活动页直接打开，无需等主包）
+  ✅ 适合活动页、广告落地页等独立场景
+  ❌ 不能引用主包的代码和资源（需要自给自足）
+  ❌ App() 中的生命周期不会触发
+```
+
+#### 分包预加载
+
+```json
+// app.json
+{
+  "preloadRule": {
+    "pages/index/index": {
+      "network": "all",          // wifi 和移动网络都预加载
+      "packages": ["packageA"]   // 在 index 页面时预加载 packageA
+    },
+    "pages/user/user": {
+      "network": "wifi",         // 仅 wifi 环境预加载
+      "packages": ["packageB"]
+    }
+  }
+}
+```
+
+```text
+预加载时机：用户进入指定页面后，在后台静默下载声明的分包
+效果：用户跳转时分包已经下载完毕，几乎无等待
+```
+
+---
+
+### 3. 启动性能优化
+
+```text
+小程序冷启动流程：
+  资源下载 → 业务代码注入 → App.onLaunch → 首页 onLoad → 首页渲染
+```
+
+**① 减少启动时同步操作**
+
+```javascript
+// ❌ onLaunch 中大量同步读取 Storage
+onLaunch() {
+  const a = wx.getStorageSync('a');
+  const b = wx.getStorageSync('b');
+  const c = wx.getStorageSync('c'); // 每次读取都阻塞
+}
+
+// ✅ 改为异步或合并读取
+onLaunch() {
+  wx.getStorage({ key: 'userData', success: ({ data }) => { ... } });
+}
+```
+
+**② 数据预拉取（wx.getBackgroundFetchData）**
+
+```json
+// app.json 开启后台预拉取
+{
+  "fetchDataTypesV2": [{ "fetchType": "pre" }]
+}
+```
+
+```javascript
+// 在 onLaunch 中获取预拉取的数据（可能比 onLoad 更早到达）
+wx.getBackgroundFetchData({
+  fetchType: 'pre',
+  success({ fetchedData }) {
+    const data = JSON.parse(fetchedData);
+    app.globalData.prefetchData = data;
+  },
+});
+```
+
+**③ 骨架屏 + 首屏直出**
+
+```javascript
+Page({
+  data: {
+    skeleton: true,  // 先展示骨架屏
+    list: [],
+  },
+
+  onLoad() {
+    // 请求完成后隐藏骨架屏
+    this.fetchData().then(list => {
+      this.setData({ list, skeleton: false });
+    });
+  },
+});
+```
+
+---
+
+### 4. 长列表性能：虚拟列表
+
+渲染几百条数据时，全量渲染 DOM 节点会导致严重卡顿。
+
+**官方方案：`<recycle-view>`（微信官方长列表组件）**
+
+```json
+// 引入组件（需安装 miniprogram-recycle-view）
+{
+  "usingComponents": {
+    "recycle-view": "miniprogram-recycle-view/recycle-view",
+    "recycle-item": "miniprogram-recycle-view/recycle-item"
+  }
+}
+```
+
+```xml
+<!-- WXML -->
+<recycle-view batch="{{batchSetRecycleData}}" id="recycleId">
+  <recycle-item wx:for="{{recycleList}}" wx:key="id">
+    <view class="item">{{item.title}}</view>
+  </recycle-item>
+</recycle-view>
+```
+
+**手写虚拟列表核心思路：**
+
+```javascript
+Page({
+  data: {
+    // 只渲染可视区域的数据
+    visibleList: [],
+    // 用 padding 撑开容器高度，模拟完整列表
+    paddingTop: 0,
+    paddingBottom: 0,
+  },
+
+  // 参数
+  ITEM_HEIGHT: 80,
+  BUFFER: 5,  // 可视区域外缓冲条数
+
+  onPageScroll({ scrollTop }) {
+    this.updateVisibleList(scrollTop);
+  },
+
+  updateVisibleList(scrollTop) {
+    const { allList, ITEM_HEIGHT, BUFFER } = this;
+    const windowHeight = wx.getSystemInfoSync().windowHeight;
+
+    const start = Math.max(0, Math.floor(scrollTop / ITEM_HEIGHT) - BUFFER);
+    const end = Math.min(
+      allList.length,
+      Math.ceil((scrollTop + windowHeight) / ITEM_HEIGHT) + BUFFER
+    );
+
+    this.setData({
+      visibleList: allList.slice(start, end),
+      paddingTop: start * ITEM_HEIGHT,
+      paddingBottom: (allList.length - end) * ITEM_HEIGHT,
+    });
+  },
+});
+```
+
+---
+
+### 5. 图片优化
+
+```javascript
+// ✅ 懒加载（进入视口才加载）
+<image lazy-load src="{{item.url}}" />
+
+// ✅ 使用 CDN + WebP 格式
+const suffix = platform === 'ios' ? '.webp' : '.jpg';
+this.setData({ imgUrl: `https://cdn.example.com/img${suffix}` });
+
+// ✅ 压缩用户上传图片（上传前处理）
+wx.compressImage({
+  src: filePath,
+  quality: 60,  // 压缩质量 0-100
+  success({ tempFilePath }) {
+    this.uploadImage(tempFilePath);
+  },
+});
+```
+
+---
+
+### 6. 性能监控与调试
+
+```javascript
+// 使用小程序性能 API
+const performance = wx.getPerformance();
+const observer = performance.createObserver((list) => {
+  list.getEntries().forEach(entry => {
+    console.log(entry.entryType, entry.name, entry.duration);
+  });
+});
+// 观察所有性能指标
+observer.observe({ entryTypes: ['render', 'script', 'navigation'] });
+```
+
+```text
+微信开发者工具中的关键指标：
+  - 初次渲染时间（首屏）< 1000ms 为优秀
+  - setData 数据量 < 256KB（超出有警告）
+  - 页面切换时间 < 300ms
+  - 内存占用 < 200MB
+```

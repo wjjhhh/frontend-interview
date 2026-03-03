@@ -1,0 +1,300 @@
+---
+title: "Web3 前端基础：区块链、钱包与签名原理"
+description: "账户模型、HD 钱包、私钥/公钥/地址推导、签名原理、交易流程、Gas 机制"
+difficulty: "中级"
+tags: ["区块链", "钱包", "私钥", "签名", "MetaMask", "Gas"]
+category: "web3"
+order: 1
+---
+
+## Web2 vs Web3 架构对比
+
+```text
+Web2（传统）                           Web3（去中心化）
+───────────────────────────            ───────────────────────────────
+用户 → 服务器 → 数据库                  用户 → 区块链节点（RPC）→ 链上状态
+身份：用户名/密码（服务器管理）           身份：私钥 → 公钥 → 地址（用户自持）
+数据：存储在中心化服务器                 数据：存储在去中心化链上（不可篡改）
+信任：信任服务提供商                    信任：信任代码（智能合约）
+资产：平台账户（可被冻结）               资产：链上 Token（只有私钥持有者控制）
+
+DApp 架构：
+  前端（React/Next.js）
+      ↓ ethers.js / viem
+  区块链节点（Infura / Alchemy / 本地节点）
+      ↓
+  以太坊 / Polygon / BNB Chain 等
+      ↓
+  智能合约（Solidity 编写，部署在链上）
+```
+
+## 高频面试题
+
+### 1. 账户、私钥、公钥、地址的关系
+
+```text
+私钥（Private Key）
+  └── 256 位随机数，eg: 0xac0974bec...（32 字节，64 位 hex）
+  └── 是账户的终极控制权，谁有私钥谁有账户
+  └── 永远不应该离开用户设备
+
+      ↓ 椭圆曲线加密（secp256k1）
+
+公钥（Public Key）
+  └── 由私钥推导，65 字节（未压缩）或 33 字节（压缩）
+  └── 可以公开，用于验证签名
+
+      ↓ Keccak-256 哈希 → 取后 20 字节
+
+以太坊地址（Address）
+  └── 0x742d35Cc6634C0532925a3b8D...（20 字节，42 字符含 0x）
+  └── 是账户的"门牌号"，可以公开
+
+推导是单向的：私钥 → 公钥 → 地址（无法反推）
+```
+
+```typescript
+import { ethers } from 'ethers';
+
+// 从私钥创建钱包
+const wallet = new ethers.Wallet('0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80');
+console.log(wallet.address);    // 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+console.log(wallet.publicKey);  // 0x04049ab...
+
+// 随机生成新钱包
+const randomWallet = ethers.Wallet.createRandom();
+console.log(randomWallet.mnemonic.phrase); // "word1 word2 ... word12"
+console.log(randomWallet.privateKey);
+console.log(randomWallet.address);
+```
+
+### 2. HD 钱包（Hierarchical Deterministic Wallet）
+
+现代钱包（MetaMask）不是一个私钥，而是从一个**助记词**派生出无数私钥：
+
+```text
+助记词（Mnemonic / Seed Phrase）
+  └── 12 或 24 个英文单词（BIP-39 标准）
+  └── "word1 word2 word3 ... word12"
+  └── 是整个钱包的根，务必备份！
+
+      ↓ PBKDF2 + SHA-512
+
+种子（Seed）（512 bits）
+
+      ↓ HMAC-SHA512（BIP-32 标准）
+
+主私钥（Master Private Key）
+
+      ↓ 派生路径（BIP-44）
+
+账户私钥（Derived Private Key）
+  路径: m/44'/60'/0'/0/0  → 第 1 个以太坊账户
+  路径: m/44'/60'/0'/0/1  → 第 2 个以太坊账户
+  路径: m/44'/60'/0'/0/2  → 第 3 个以太坊账户
+
+m / purpose' / coinType' / account' / change / index
+         44'      60'         0'        0       0,1,2...
+              ↑以太坊      ↑账户0
+```
+
+```typescript
+import { ethers } from 'ethers';
+
+const mnemonic = 'test test test test test test test test test test test junk';
+
+// 从助记词创建 HD 节点
+const hdNode = ethers.HDNodeWallet.fromPhrase(mnemonic);
+
+// 派生多个账户
+for (let i = 0; i < 3; i++) {
+  const child = hdNode.derivePath(`m/44'/60'/0'/0/${i}`);
+  console.log(`账户 ${i}:`, child.address);
+}
+// 账户 0: 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+// 账户 1: 0x70997970C51812dc3A010C7d01b50e0d17dc79C8
+// 账户 2: 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC
+```
+
+### 3. 签名原理：如何证明"我是我"
+
+Web3 的身份验证不依赖服务器，而是通过**数字签名**：
+
+```text
+签名流程：
+  消息（Message）
+      ↓ + 私钥（只有我有）
+  ECDSA 签名算法
+      ↓
+  签名（Signature）：{ r, s, v }（65 字节）
+
+验证流程：
+  签名 + 消息
+      ↓ 椭圆曲线恢复
+  公钥 → 地址
+      ↓ 对比
+  与声明的地址是否一致？→ 身份验证通过
+```
+
+```typescript
+// 前端：用户用钱包签名（MetaMask 弹出确认框）
+const provider = new ethers.BrowserProvider(window.ethereum);
+const signer = await provider.getSigner();
+
+// 签名一条消息（如 nonce）
+const message = 'Login to MyApp: nonce=abc123';
+const signature = await signer.signMessage(message);
+// 0x... (65 字节的签名)
+
+// 后端：验证签名（不需要私钥）
+const recoveredAddress = ethers.verifyMessage(message, signature);
+// 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+if (recoveredAddress.toLowerCase() === claimedAddress.toLowerCase()) {
+  // 身份验证通过，生成 JWT session
+}
+```
+
+**这就是 SIWE（Sign-In With Ethereum）的核心原理。**
+
+### 4. 交易流程与 Gas 机制
+
+```text
+发起交易的完整流程：
+
+① 用户在 DApp 点击"转账"
+② 前端构建交易对象：
+   {
+     to: '0x目标地址',
+     value: ethers.parseEther('0.1'),  // 0.1 ETH
+     gasLimit: 21000,                   // 预估消耗 gas 上限
+     maxFeePerGas: 30n * 10n**9n,      // 最高愿意付的单价（wei）
+     nonce: 5,                          // 防重放攻击（账户发送的第 N 笔交易）
+   }
+③ MetaMask 弹出确认框，用户确认
+④ MetaMask 用私钥对交易签名
+⑤ 将签名后的交易广播到以太坊节点
+⑥ 矿工/验证者打包进区块
+⑦ 等待区块确认（约 12 秒/块，通常等 3 块确认）
+```
+
+```typescript
+// Gas 费用计算（EIP-1559 后）
+// 实际费用 = min(maxFeePerGas, baseFee + maxPriorityFeePerGas) × gasUsed
+
+const tx = await signer.sendTransaction({
+  to: recipientAddress,
+  value: ethers.parseEther('0.1'),
+});
+
+console.log('交易 hash:', tx.hash);     // 交易的唯一标识
+
+// 等待交易确认（至少 1 个区块）
+const receipt = await tx.wait(1);       // 等待 1 个区块确认
+console.log('区块号:', receipt.blockNumber);
+console.log('Gas 消耗:', receipt.gasUsed.toString());
+console.log('实际费用:', ethers.formatEther(receipt.fee), 'ETH');
+```
+
+### 5. Provider vs Signer
+
+```typescript
+// Provider：只读，连接节点，可以查询链上数据
+// Signer：可读写，持有私钥或能调用钱包，可以发送交易
+
+// 方式1：JSON-RPC Provider（后端/不需要钱包）
+const provider = new ethers.JsonRpcProvider('https://mainnet.infura.io/v3/YOUR_KEY');
+const balance = await provider.getBalance('0xf39Fd6...');
+const block = await provider.getBlock('latest');
+
+// 方式2：Browser Provider（前端，连接 MetaMask）
+const browserProvider = new ethers.BrowserProvider(window.ethereum);
+
+// 只读操作（不需要解锁钱包）
+const balance = await browserProvider.getBalance(address);
+
+// 写操作（需要用户授权）
+const signer = await browserProvider.getSigner();
+// 此时 MetaMask 弹出"连接钱包"授权
+
+// Signer 派生自 Provider，具备 Provider 的所有能力
+const tx = await signer.sendTransaction({ to: '0x...', value: 0n });
+```
+
+### 6. 常见链与 Chain ID
+
+```text
+Chain ID 是每条链的唯一标识（防止重放攻击跨链生效）：
+
+Chain ID   链名称              原生代币
+─────────  ─────────────────  ─────────
+1          Ethereum Mainnet   ETH
+5          Goerli (测试网)     ETH
+11155111   Sepolia (测试网)    ETH
+137        Polygon Mainnet    MATIC
+80001      Mumbai (测试网)     MATIC
+56         BNB Smart Chain    BNB
+42161      Arbitrum One       ETH
+10         Optimism           ETH
+8453       Base               ETH
+
+切换链：
+```
+
+```typescript
+// 检查当前链
+const network = await provider.getNetwork();
+console.log('Chain ID:', network.chainId); // 1n（bigint）
+
+// 要求用户切换到 Polygon
+await window.ethereum.request({
+  method: 'wallet_switchEthereumChain',
+  params: [{ chainId: '0x89' }], // 137 → 0x89
+});
+
+// 如果链不存在，先添加
+await window.ethereum.request({
+  method: 'wallet_addEthereumChain',
+  params: [{
+    chainId: '0x89',
+    chainName: 'Polygon Mainnet',
+    nativeCurrency: { name: 'MATIC', symbol: 'MATIC', decimals: 18 },
+    rpcUrls: ['https://polygon-rpc.com'],
+    blockExplorerUrls: ['https://polygonscan.com'],
+  }],
+});
+```
+
+## 深入追问
+
+### 私钥安全：为什么 DApp 永远不应该要求私钥？
+
+```text
+钱包安全层级（从高到低）：
+  硬件钱包（Ledger/Trezor）  ← 私钥从不接触联网设备，最安全
+  浏览器钱包（MetaMask）     ← 私钥加密存在本地，有助记词泄露风险
+  热钱包（交易所账户）        ← 私钥由平台托管，非自托管
+  明文私钥                   ← 任何要求你提供私钥的都是钓鱼
+
+DApp 的正确交互模式：
+  ❌ 要求用户输入私钥或助记词
+  ✅ 通过 MetaMask/钱包弹窗让用户签名或确认交易
+  ✅ 用 signMessage 做身份验证（不发交易，不消耗 Gas）
+```
+
+### nonce 的作用
+
+```text
+账户 nonce = 该地址已发送的交易总数（从 0 开始）
+
+作用1：防止重放攻击
+  如果没有 nonce，攻击者可以将你的交易广播多次
+  有了 nonce，每笔交易有唯一序号，重复广播会被拒绝
+
+作用2：交易排序
+  同一账户的交易按 nonce 顺序打包
+  nonce=5 的交易必须在 nonce=4 之后处理
+
+作用3：替换待确认交易
+  用相同 nonce 但更高 Gas 费用的新交易，可以"覆盖"旧的未确认交易
+  （俗称"加速"或"取消"交易）
+```

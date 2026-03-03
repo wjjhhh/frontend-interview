@@ -1,0 +1,286 @@
+---
+title: "小程序架构与双线程模型"
+description: "双线程运行机制、渲染层与逻辑层通信、生命周期、与普通 H5 的核心差异"
+difficulty: "高级"
+tags: ["小程序", "双线程", "JSBridge", "生命周期", "微信小程序", "WebView"]
+category: "miniprogram"
+order: 1
+---
+
+## 为什么小程序要用双线程？
+
+普通 H5 页面中，JS 和 DOM 渲染跑在同一个线程里——JS 执行时渲染会卡顿，而且 JS 可以任意操作 DOM，存在 XSS 风险。
+
+小程序为了**安全可控**（平台审核、防止恶意脚本）同时**保证流畅**，设计了双线程架构：
+
+```text
+┌─────────────────────────────────────────────────────────┐
+│                     微信客户端（Native）                  │
+│                                                         │
+│  ┌──────────────────┐        ┌──────────────────────┐  │
+│  │   渲染层（View）  │        │  逻辑层（AppService） │  │
+│  │                  │        │                      │  │
+│  │  WebView 1       │        │  JS Engine           │  │
+│  │  WXML + WXSS     │◄──────►│  (V8 / JavaScriptCore│  │
+│  │  虚拟 DOM 渲染    │        │  无 DOM / BOM API)   │  │
+│  │                  │        │                      │  │
+│  │  WebView 2 ...   │        │  Page() / App()      │  │
+│  └──────────────────┘        └──────────────────────┘  │
+│           ▲                            ▲                │
+│           └──────── JSBridge ──────────┘                │
+│                  （Native 中转）                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+## 高频面试题
+
+### 1. 双线程通信流程
+
+逻辑层与渲染层**不能直接通信**，必须经过 Native（客户端）中转：
+
+```text
+逻辑层触发数据更新：
+  Page.setData({ count: 1 })
+    │
+    ├─ 将数据序列化为 JSON 字符串
+    │
+    ├─ 通过 JSBridge 发送给 Native
+    │
+    ├─ Native 转发给渲染层 WebView
+    │
+    └─ 渲染层收到数据 → diff 虚拟 DOM → 更新真实 DOM
+
+用户交互触发事件（如 tap）：
+  渲染层捕获事件
+    │
+    ├─ 序列化事件对象
+    ├─ JSBridge → Native → 逻辑层
+    └─ 逻辑层执行对应的事件处理函数
+```
+
+**关键限制**：
+- 逻辑层**没有** `window`、`document`，无法直接操作 DOM
+- 每次 `setData` 都涉及跨线程通信，数据量大时有明显延迟
+- 异步通信意味着 `setData` 后无法立即读取到 DOM 变化
+
+---
+
+### 2. 与普通 H5 / Web 的核心差异
+
+| 对比项 | 普通 H5 | 小程序 |
+|--------|---------|--------|
+| 运行环境 | 浏览器单线程 | 双线程（逻辑层 + 渲染层） |
+| DOM 操作 | 直接操作 | 禁止，通过 `setData` 驱动 |
+| 路由 | `history` / `hash` | `wx.navigateTo` 等 API |
+| 网络请求 | `fetch` / `XMLHttpRequest` | `wx.request`（需配置域名白名单） |
+| 存储 | `localStorage` | `wx.setStorageSync` |
+| 包大小限制 | 无 | 主包 ≤ 2MB，总包 ≤ 20MB |
+| 审核机制 | 无 | 需提交平台审核 |
+
+---
+
+### 3. 小程序生命周期
+
+#### App 生命周期
+
+```javascript
+App({
+  // 小程序初始化完成（全局只触发一次）
+  onLaunch(options) {
+    // options.scene: 场景值（从哪里进入）
+    // options.query: 启动参数
+    console.log('App launched');
+  },
+
+  // 小程序从后台进入前台（或初次显示）
+  onShow(options) {
+    // 可在此处恢复音频、刷新数据
+  },
+
+  // 小程序从前台进入后台（按 Home 键等）
+  onHide() {
+    // 暂停音频、上报数据
+  },
+
+  // 脚本错误或 API 调用失败
+  onError(msg) {
+    console.error(msg);
+  },
+
+  // 全局共享数据（替代全局变量）
+  globalData: { userInfo: null },
+});
+```
+
+#### Page 生命周期
+
+```javascript
+Page({
+  data: { count: 0 },
+
+  // 页面加载（只触发一次）
+  onLoad(options) {
+    // options 是页面路由参数，如 /pages/detail?id=123 → { id: '123' }
+    this.loadData(options.id);
+  },
+
+  // 页面显示（每次从后台/其他页面返回都触发）
+  onShow() {
+    // 适合刷新需要实时性的数据
+  },
+
+  // 页面初次渲染完成
+  onReady() {
+    // 可在此操作组件（如 canvas、video）
+  },
+
+  // 页面隐藏（跳转到其他页面时）
+  onHide() {},
+
+  // 页面卸载（redirectTo 或 navigateBack 时）
+  onUnload() {
+    // 清理定时器、取消订阅
+  },
+
+  // 下拉刷新（需在 json 配置中开启 enablePullDownRefresh）
+  onPullDownRefresh() {
+    this.loadData().then(() => wx.stopPullDownRefresh());
+  },
+
+  // 上拉触底（滚动到底部）
+  onReachBottom() {
+    this.loadMore();
+  },
+
+  // 页面滚动
+  onPageScroll({ scrollTop }) {},
+
+  // 分享
+  onShareAppMessage() {
+    return { title: '分享标题', path: '/pages/index/index' };
+  },
+});
+```
+
+#### 完整生命周期顺序
+
+```text
+冷启动（首次打开）：
+  App.onLaunch → App.onShow → Page.onLoad → Page.onShow → Page.onReady
+
+页面跳转（A → B）：
+  A.onHide → B.onLoad → B.onShow → B.onReady
+
+从 B 返回 A：
+  B.onUnload → A.onShow
+
+小程序切后台：
+  Page.onHide → App.onHide
+
+小程序切前台：
+  App.onShow → Page.onShow
+```
+
+---
+
+### 4. Component 自定义组件生命周期
+
+```javascript
+Component({
+  // 组件数据
+  data: { name: '' },
+
+  // 组件接收的外部属性
+  properties: {
+    title: { type: String, value: '' },
+  },
+
+  lifetimes: {
+    // 组件实例刚被创建（此时 properties 已初始化，但未挂载到页面）
+    created() {},
+
+    // 组件被附加到页面节点树（可以操作 DOM）
+    attached() {
+      this.setData({ name: this.properties.title });
+    },
+
+    // 组件从页面节点树移除
+    detached() {
+      // 清理副作用
+    },
+  },
+
+  pageLifetimes: {
+    // 组件所在页面显示时
+    show() {},
+    // 组件所在页面隐藏时
+    hide() {},
+  },
+
+  methods: {
+    handleTap() {
+      // 触发自定义事件，通知父组件
+      this.triggerEvent('itemClick', { id: 1 });
+    },
+  },
+});
+```
+
+---
+
+### 5. 页面栈与路由
+
+```javascript
+// 小程序维护一个页面栈，最多 10 层
+wx.navigateTo({ url: '/pages/b/b' });  // 保留当前页，跳转新页（入栈）
+wx.redirectTo({ url: '/pages/b/b' });  // 关闭当前页，跳转新页（替换）
+wx.navigateBack({ delta: 1 });         // 返回上一页（出栈）
+wx.switchTab({ url: '/pages/home' });  // 跳转 tabBar 页面（清空栈）
+wx.reLaunch({ url: '/pages/home' });   // 关闭所有页，打开新页（清空栈）
+
+// 获取当前页面栈
+const pages = getCurrentPages();
+const currentPage = pages[pages.length - 1];
+const prevPage = pages[pages.length - 2];
+
+// 跨页面传值（返回时向上一页传值）
+prevPage.setData({ refreshFlag: true });
+wx.navigateBack();
+```
+
+---
+
+### 6. 小程序登录流程
+
+```text
+前端                    后端                   微信服务器
+  │                       │                       │
+  ├─ wx.login() ──────────────────────────────────►│
+  │◄─────────────── code ─────────────────────────┤
+  │                       │                       │
+  ├─ 发送 code 到后端 ────►│                       │
+  │                       ├─ code + appid + secret ►│
+  │                       │◄─ openid + session_key ─┤
+  │                       │                       │
+  │                       ├─ 生成自定义 token       │
+  │◄─────── token ────────┤                       │
+  │                       │                       │
+  ├─ 存储 token（Storage） │                       │
+  ├─ 后续请求携带 token ──►│                       │
+```
+
+```javascript
+// 前端实现
+wx.login({
+  success({ code }) {
+    wx.request({
+      url: 'https://api.example.com/login',
+      method: 'POST',
+      data: { code },
+      success({ data }) {
+        wx.setStorageSync('token', data.token);
+      },
+    });
+  },
+});
+```

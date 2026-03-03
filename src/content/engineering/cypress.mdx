@@ -1,0 +1,441 @@
+---
+title: "Cypress 深度原理与实战"
+description: "Cypress 架构原理、命令队列机制、自动重试、网络拦截、组件测试、与 Playwright 底层对比"
+difficulty: "高级"
+tags: ["Cypress", "E2E测试", "命令队列", "组件测试", "cy.intercept", "架构原理"]
+category: "engineering"
+order: 6
+---
+
+## Cypress 为什么与众不同？
+
+传统 E2E 工具（Selenium、WebDriver）通过 HTTP 协议远程控制浏览器；Cypress 完全颠覆了这个模型：
+
+```text
+Selenium / WebDriver 架构：
+  测试代码（Node.js）
+      ↓ HTTP / WebSocket（WebDriver 协议）
+  浏览器驱动（ChromeDriver）
+      ↓
+  浏览器进程
+  → 网络往返延迟，命令异步执行，不稳定
+
+Cypress 架构：
+  Node.js 进程（Cypress Server）
+      ↕ IPC（进程间通信）
+  浏览器进程
+  ├── Cypress 运行时（与应用同一个 JS 上下文！）
+  │       ↓ 直接操作 DOM / window / XHR
+  └── 被测应用（iframe 内）
+
+关键差异：Cypress 的测试代码运行在浏览器内部
+  → 可以直接访问 window、document、应用的全局变量
+  → 命令同步执行，天然稳定
+  → 可以拦截网络（在浏览器层面）
+  → 无法做跨域、多标签页操作（浏览器安全限制）
+```
+
+## 高频面试题
+
+### 1. 命令队列（Command Queue）原理
+
+**Cypress 命令不是同步执行的，也不是 Promise——而是入队。**
+
+```javascript
+// 你写的代码（看起来是同步）：
+cy.visit('/login')
+cy.get('input[name="email"]').type('user@example.com')
+cy.get('button').click()
+cy.url().should('include', '/dashboard')
+
+// 实际执行机制：
+// 1. Cypress 将这 4 条命令依次加入命令队列
+// 2. 测试函数返回后，队列开始顺序执行
+// 3. 每条命令执行完毕，自动等待下一条的前提条件满足
+
+// 常见误区：命令返回的不是 Promise！
+const url = cy.url()  // ❌ url 是 Chainer 对象，不是字符串
+console.log(url)      // 打印的是 Cypress 对象，不是 URL 值
+
+// ✅ 正确：在回调中使用值
+cy.url().then((url) => {
+  console.log(url)   // 真实 URL 字符串
+  expect(url).to.include('/dashboard')
+})
+```
+
+```javascript
+// 为什么不是 Promise？
+// Promise 一旦创建立即执行，Cypress 需要先收集完所有命令再统一执行
+// 这样才能实现：命令重试、时间旅行调试、截图录制等功能
+
+// ❌ 不要在 Cypress 命令中混用 async/await
+it('bad example', async () => {
+  await cy.visit('/')  // ❌ cy.visit() 返回 Chainer，不是真 Promise
+  // 这样写会导致命令顺序混乱
+})
+
+// ✅ 少数需要真 Promise 的场景，用 cy.wrap()
+it('good example', () => {
+  cy.wrap(fetchToken()).then((token) => {
+    cy.visit('/', { headers: { Authorization: `Bearer ${token}` } })
+  })
+})
+```
+
+### 2. 自动等待与重试机制
+
+Cypress 每条命令内置**重试**，这是它"稳定"的核心原因：
+
+```text
+cy.get('.submit-btn').should('be.enabled').click()
+
+执行流程：
+  t=0ms    cy.get('.submit-btn') → 找到元素
+  t=0ms    .should('be.enabled') → 元素 disabled，断言失败
+  t=50ms   重试 .get + .should   → 还是 disabled
+  t=100ms  重试 .get + .should   → 还是 disabled
+  ...
+  t=1500ms 重试 .get + .should   → enabled！断言通过
+  t=1500ms .click()              → 执行点击
+
+默认超时：
+  cy.get()          → 4000ms
+  cy.find()         → 4000ms
+  cy.should()       → 4000ms
+  cy.wait()         → 5000ms（等待 @alias 请求）
+  页面加载超时       → 60000ms
+```
+
+```javascript
+// 修改超时
+cy.get('.slow-element', { timeout: 10000 }).should('be.visible')
+
+// 全局修改（cypress.config.js）
+export default defineConfig({
+  defaultCommandTimeout: 6000,
+  pageLoadTimeout: 30000,
+  requestTimeout: 5000,
+})
+
+// 重试的范围：
+// ✅ 被重试：cy.get、cy.find、cy.contains、.should（断言）
+// ❌ 不重试：cy.click、cy.type、cy.request（动作命令只执行一次）
+```
+
+### 3. cy.intercept 网络拦截原理
+
+Cypress 在浏览器内通过 **Service Worker + XHR/Fetch 代理**拦截请求，比 Playwright 的 CDP 更深：
+
+```javascript
+// 基础：stub 响应（完全替换）
+cy.intercept('GET', '/api/users', {
+  statusCode: 200,
+  body: [{ id: 1, name: 'Alice' }, { id: 2, name: 'Bob' }],
+}).as('getUsers')
+
+cy.visit('/users')
+cy.wait('@getUsers')  // 等待请求发出（确保组件已请求数据）
+cy.get('[data-testid="user-list"]').should('have.length', 2)
+
+// 动态 stub（根据请求内容返回不同响应）
+cy.intercept('POST', '/api/login', (req) => {
+  if (req.body.email === 'admin@example.com') {
+    req.reply({ statusCode: 200, body: { role: 'admin', token: 'admin-token' } })
+  } else {
+    req.reply({ statusCode: 401, body: { error: '密码错误' } })
+  }
+}).as('login')
+
+// 修改真实响应（代理模式）
+cy.intercept('GET', '/api/products', (req) => {
+  req.continue((res) => {
+    // 修改真实 API 返回的数据
+    res.body.items = res.body.items.slice(0, 3)  // 只保留前 3 条
+    res.body.total = 3
+  })
+})
+
+// 模拟网络错误
+cy.intercept('GET', '/api/data', { forceNetworkError: true })
+
+// 模拟慢网络（延迟响应）
+cy.intercept('GET', '/api/slow', (req) => {
+  req.reply((res) => {
+    res.setDelay(3000)  // 延迟 3 秒
+    res.send()
+  })
+})
+
+// 断言请求内容
+cy.intercept('POST', '/api/order').as('createOrder')
+cy.get('[data-testid="checkout-btn"]').click()
+cy.wait('@createOrder').then(({ request, response }) => {
+  expect(request.body).to.deep.include({ productId: '123', quantity: 2 })
+  expect(response.statusCode).to.eq(201)
+})
+```
+
+### 4. 自定义命令（Custom Commands）
+
+将重复操作封装成语义化命令：
+
+```javascript
+// cypress/support/commands.ts
+
+// 登录命令（通过 API，跳过 UI，速度更快）
+Cypress.Commands.add('loginByApi', (email: string, password: string) => {
+  cy.request({
+    method: 'POST',
+    url: '/api/auth/login',
+    body: { email, password },
+  }).then((response) => {
+    // 直接设置 localStorage/cookie，跳过 UI 登录
+    window.localStorage.setItem('token', response.body.token)
+    cy.setCookie('session', response.body.sessionId)
+  })
+})
+
+// 带类型声明（TypeScript）
+declare global {
+  namespace Cypress {
+    interface Chainable {
+      loginByApi(email: string, password: string): Chainable<void>
+      seedDatabase(fixture: string): Chainable<void>
+      getByTestId(testId: string): Chainable<JQuery<HTMLElement>>
+    }
+  }
+}
+
+// 语义化查询（替代 cy.get('[data-testid="xxx"]')）
+Cypress.Commands.add('getByTestId', (testId: string) => {
+  return cy.get(`[data-testid="${testId}"]`)
+})
+
+// 数据库 seed（通过 cy.task 调用 Node.js 代码）
+Cypress.Commands.add('seedDatabase', (fixture: string) => {
+  cy.task('seedDb', fixture)  // 执行服务端数据库操作
+})
+
+// 使用
+it('登录后看到 dashboard', () => {
+  cy.loginByApi('user@example.com', 'password')
+  cy.visit('/dashboard')
+  cy.getByTestId('welcome-message').should('contain', '欢迎回来')
+})
+```
+
+### 5. cy.task：在浏览器内调用 Node.js
+
+Cypress 的浏览器进程与 Node.js 进程通过 IPC 通信，`cy.task` 桥接两者：
+
+```javascript
+// cypress.config.ts
+import { defineConfig } from 'cypress'
+import { db } from './src/db'
+
+export default defineConfig({
+  e2e: {
+    setupNodeEvents(on) {
+      on('task', {
+        // 直接操作数据库（在 Node.js 进程中执行）
+        async seedDb({ table, data }) {
+          await db(table).insert(data)
+          return null  // cy.task 必须返回非 undefined
+        },
+        async cleanDb(table: string) {
+          await db(table).truncate()
+          return null
+        },
+        // 读取文件
+        readFileMaybe(filename: string) {
+          if (fs.existsSync(filename)) {
+            return fs.readFileSync(filename, 'utf8')
+          }
+          return null
+        },
+        // 生成测试数据
+        generateUser() {
+          return {
+            id: crypto.randomUUID(),
+            email: `test-${Date.now()}@example.com`,
+            name: 'Test User',
+          }
+        },
+      })
+    },
+  },
+})
+
+// 在测试中使用
+beforeEach(() => {
+  cy.task('cleanDb', 'users')
+  cy.task('seedDb', { table: 'users', data: { id: '1', email: 'test@example.com' } })
+})
+
+it('显示用户列表', () => {
+  cy.task('generateUser').then((user) => {
+    cy.task('seedDb', { table: 'users', data: user })
+    cy.visit('/admin/users')
+    cy.contains(user.email).should('be.visible')
+  })
+})
+```
+
+### 6. Cypress 组件测试（Component Testing）
+
+Cypress 不只能做 E2E，还能做**组件级测试**（直接挂载 React 组件，无需浏览器导航）：
+
+```javascript
+// cypress/component/Button.cy.tsx
+import { Button } from '../../src/components/Button'
+
+describe('Button 组件', () => {
+  it('渲染文字', () => {
+    cy.mount(<Button>点击我</Button>)
+    cy.contains('点击我').should('be.visible')
+  })
+
+  it('点击触发 onClick', () => {
+    const onClick = cy.stub().as('onClick')
+    cy.mount(<Button onClick={onClick}>提交</Button>)
+    cy.get('button').click()
+    cy.get('@onClick').should('have.been.calledOnce')
+  })
+
+  it('disabled 状态', () => {
+    cy.mount(<Button disabled>提交</Button>)
+    cy.get('button').should('be.disabled')
+    cy.get('button').click({ force: true })
+    // disabled 按钮点击不触发事件
+  })
+
+  it('loading 状态显示 spinner', () => {
+    cy.mount(<Button loading>提交</Button>)
+    cy.get('[data-testid="spinner"]').should('be.visible')
+    cy.contains('提交').should('not.exist')
+  })
+})
+
+// 优势 vs RTL（React Testing Library）：
+// ✅ 真实浏览器环境（不是 jsdom）
+// ✅ 可以直接截图对比（视觉测试）
+// ✅ 时间旅行调试（每个命令的 DOM 快照）
+// ✅ 测试 CSS 动画、真实事件
+// ❌ 比 RTL 慢（需要启动浏览器）
+```
+
+### 7. 时钟控制：cy.clock / cy.tick
+
+```javascript
+// 场景：测试 30 分钟后自动退出登录
+it('30分钟后自动退出', () => {
+  cy.clock()  // 接管 Date、setTimeout、setInterval、clearTimeout 等
+
+  cy.loginByApi('user@example.com', 'password')
+  cy.visit('/dashboard')
+  cy.contains('欢迎回来').should('be.visible')
+
+  // 快进 30 分钟（不真实等待！）
+  cy.tick(30 * 60 * 1000)
+
+  cy.url().should('include', '/login')
+  cy.contains('会话已过期，请重新登录').should('be.visible')
+})
+
+// 场景：测试倒计时组件
+it('倒计时正确递减', () => {
+  cy.clock(Date.now())  // 固定当前时间
+  cy.mount(<CountdownTimer seconds={5} />)
+
+  cy.contains('5').should('be.visible')
+  cy.tick(1000)
+  cy.contains('4').should('be.visible')
+  cy.tick(4000)
+  cy.contains('时间到！').should('be.visible')
+})
+
+// 恢复真实时钟
+cy.clock().then((clock) => clock.restore())
+// 或：cy.tick() 之后自动恢复
+```
+
+## 深入追问
+
+### Cypress vs Playwright 底层架构本质区别
+
+```text
+Cypress                              Playwright
+──────────────────────────           ──────────────────────────────
+运行位置：浏览器内（同 JS 上下文）    运行位置：Node.js（通过 CDP 控制）
+通信方式：直接 DOM 操作               通信方式：CDP（Chrome DevTools Protocol）
+多标签页：不支持（同源限制）           多标签页：完全支持
+多浏览器：Chromium + Firefox          Chromium + Firefox + WebKit
+iframe：有限支持                      完全支持
+并行：免费版串行，需配置              原生并行（独立 worker）
+组件测试：官方支持（Cypress CT）      官方支持（实验性）
+调试体验：时间旅行，可回看每步 DOM     trace 录像，可回放
+
+选型建议：
+  Cypress  → 快速上手，交互式调试，组件测试，中小团队
+  Playwright → 跨浏览器，多标签，CI 高并发，复杂流程
+```
+
+### 为什么 Cypress 不支持多标签页？
+
+```text
+Cypress 运行在被测应用的同一个浏览器 Tab 内
+浏览器安全模型：
+  - 跨源 iframe 内的 JS 无法访问父页面
+  - 一个 Tab 的脚本无法控制另一个 Tab
+  - 这是浏览器的基本安全边界，Cypress 无法绕过
+
+处理需要新标签页的场景：
+  1. 阻止新标签页打开，在当前页测试目标 URL
+  2. 用 cy.request() 直接验证目标页面返回内容
+  3. 将多标签场景改为单标签（如：target="_self"）
+  4. 改用 Playwright（支持多标签）
+```
+
+### cypress.config.js 关键配置
+
+```javascript
+import { defineConfig } from 'cypress'
+
+export default defineConfig({
+  e2e: {
+    baseUrl: 'http://localhost:3000',
+    specPattern: 'cypress/e2e/**/*.cy.{js,ts}',
+    supportFile: 'cypress/support/e2e.ts',
+
+    // 测试隔离（每个 it 前清除 cookie/localStorage）
+    testIsolation: true,
+
+    // 视频录制（CI 失败时排查）
+    video: true,
+    videoCompression: 32,
+
+    // 截图
+    screenshotOnRunFailure: true,
+    screenshotsFolder: 'cypress/screenshots',
+
+    // 重试（CI 环境不稳定时）
+    retries: { runMode: 2, openMode: 0 },
+
+    // 等待超时
+    defaultCommandTimeout: 6000,
+    pageLoadTimeout: 30000,
+
+    // 环境变量
+    env: {
+      apiUrl: 'http://localhost:3001',
+      adminEmail: 'admin@example.com',
+    },
+  },
+
+  component: {
+    devServer: { framework: 'next', bundler: 'webpack' },
+    specPattern: 'src/**/*.cy.{ts,tsx}',
+  },
+})
+```

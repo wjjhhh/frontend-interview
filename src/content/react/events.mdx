@@ -1,0 +1,328 @@
+---
+title: "React 事件系统深度解析"
+description: "合成事件机制、事件委托原理、React 17 变更、与原生事件的执行顺序"
+difficulty: "中级"
+tags: ["事件系统", "合成事件", "事件委托", "React 17", "事件冒泡"]
+category: "react"
+order: 6
+---
+
+## 核心原理：事件委托
+
+React **不**给每个元素直接绑定原生事件监听器，而是统一委托到容器节点，通过事件冒泡捕获所有事件：
+
+```text
+React 16：委托到 document
+React 17+：委托到根节点（ReactDOM.render 或 createRoot 挂载的容器）
+
+                  document
+                      │
+                    #root  ← React 17+ 在这里注册所有监听器
+                      │
+                   <App>
+                      │
+                   <div>
+                      │
+                 <button onClick={fn}>  ← 点击这里
+
+事件冒泡路径：button → div → App → #root（触发 React 合成事件）→ document
+```
+
+**为什么改成委托到 root？**
+
+React 16 委托到 `document` 时，如果页面有多个 React 根（微前端场景），或者混用 jQuery 等库在 `document` 上 `stopPropagation()`，会导致 React 事件被意外拦截。改到 root 后，每个 React 应用只管自己容器内的事件，完全隔离。
+
+## 高频面试题
+
+### 1. 合成事件（SyntheticEvent）是什么？
+
+React 用 `SyntheticEvent` 包装原生事件，提供跨浏览器统一 API：
+
+```javascript
+// 原生事件不统一：
+// IE：window.event, attachEvent
+// 标准：addEventListener, event.target
+
+// React 合成事件：统一接口
+function handleClick(e) {
+  // e 是 SyntheticEvent，跨浏览器行为一致
+  e.preventDefault();   // 阻止默认行为
+  e.stopPropagation();  // 阻止 React 事件冒泡
+  e.nativeEvent;        // 原始原生事件对象
+  e.target;             // 触发元素
+  e.currentTarget;      // 当前处理元素
+}
+```
+
+**React 17 前的事件池（Event Pooling）——已废弃：**
+
+```javascript
+// React 16 及之前：SyntheticEvent 被复用，回调结束后属性归零
+function handleClick(e) {
+  console.log(e.type); // "click" ✅
+  setTimeout(() => {
+    console.log(e.type); // null ❌（React 16 已回收）
+  }, 0);
+
+  // 解决方案：e.persist() 阻止回收（React 17+ 无此问题）
+  e.persist();
+}
+
+// React 17+：不再使用事件池，e.persist() 变为空操作
+```
+
+### 2. React 事件与原生事件的执行顺序
+
+**React 17+ 的执行顺序：**
+
+```text
+┌─────────────────────────────────────────────────────┐
+│ 点击 <button>                                        │
+│                                                     │
+│  1. [捕获阶段] 原生事件从 document → root → button  │
+│  2. [捕获阶段] React 捕获事件处理器执行             │
+│  3. [冒泡阶段] button → root 的原生监听器执行       │
+│  4. [冒泡阶段] React root 上的冒泡监听器执行        │
+│     → React onClick 在这里触发                      │
+│  5. [冒泡阶段] root → document 原生监听器执行       │
+└─────────────────────────────────────────────────────┘
+```
+
+```javascript
+function App() {
+  useEffect(() => {
+    // 原生事件直接绑定到 DOM
+    document.addEventListener('click', () => console.log('4. document 原生冒泡'));
+    document.getElementById('root').addEventListener('click', () => console.log('3. root 原生冒泡'));
+
+    document.getElementById('btn').addEventListener('click', () => console.log('1. button 原生冒泡'));
+  }, []);
+
+  return (
+    <button
+      id="btn"
+      onClick={() => console.log('2. React onClick')}
+    >
+      点击
+    </button>
+  );
+}
+
+// 点击后输出顺序：
+// 1. button 原生冒泡    （最内层先执行）
+// 2. React onClick     （React 在 root 处理）
+// 3. root 原生冒泡     （root 上的原生监听）
+// 4. document 原生冒泡 （最外层最后）
+```
+
+> ⚠️ 如果在原生事件中调用 `e.stopPropagation()`，阻止冒泡到 root，React 的 onClick 就**不会触发**。
+
+### 3. React 中阻止冒泡的两种方式
+
+```javascript
+function Parent() {
+  return (
+    <div onClick={() => console.log('parent')}>
+      <Child />
+    </div>
+  );
+}
+
+function Child() {
+  function handleClick(e) {
+    // ✅ 阻止 React 合成事件冒泡（parent onClick 不触发）
+    e.stopPropagation();
+
+    // ✅ 阻止原生事件冒泡（到达不了 document 上的原生监听器）
+    e.nativeEvent.stopImmediatePropagation();
+  }
+
+  return <button onClick={handleClick}>点击</button>;
+}
+```
+
+### 4. 为什么 React 使用 onXxx 而非 addEventListener？
+
+```javascript
+// ❌ 在 React 中直接用原生方法：
+// 1. 每次渲染都要手动 removeEventListener（否则内存泄漏）
+// 2. 需要在 useEffect 里写，且要注意依赖
+// 3. 无法利用 React 合成事件的跨浏览器兼容性
+
+// ✅ 使用 React 的 onXxx
+// 1. React 统一管理生命周期，组件卸载自动清理
+// 2. 跨浏览器兼容（e.target、e.preventDefault 等统一行为）
+// 3. 通过事件委托，减少实际 DOM 监听器数量
+
+// ❌ 错误示范（常见内存泄漏）
+useEffect(() => {
+  window.addEventListener('resize', handleResize);
+  // 忘记返回清理函数！
+}, []);
+
+// ✅ 正确做法
+useEffect(() => {
+  window.addEventListener('resize', handleResize);
+  return () => window.removeEventListener('resize', handleResize);
+}, []);
+```
+
+### 5. onClickCapture：捕获阶段处理事件
+
+```javascript
+// React 支持捕获阶段监听（在冒泡阶段之前执行）
+function Modal({ onClose, children }) {
+  // 捕获阶段：点击任意子元素都会先触发这里
+  // 适合"点击外部关闭"等场景
+  return (
+    <div
+      onClickCapture={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+// 执行顺序：
+// onClickCapture（父，捕获）→ onClickCapture（子，捕获）
+// → onClick（子，冒泡）→ onClick（父，冒泡）
+```
+
+### 6. 高性能事件处理：防抖与节流
+
+```javascript
+import { useCallback, useRef } from 'react';
+
+// ✅ useCallback + useRef 实现稳定引用的防抖
+function useDebounce<T extends (...args: unknown[]) => void>(fn: T, delay: number): T {
+  const timerRef = useRef<ReturnType<typeof setTimeout>>();
+
+  return useCallback(
+    (...args: Parameters<T>) => {
+      clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(() => fn(...args), delay);
+    },
+    [fn, delay]
+  ) as T;
+}
+
+function SearchInput() {
+  const handleSearch = useDebounce((value: string) => {
+    fetchResults(value);
+  }, 300);
+
+  return <input onChange={(e) => handleSearch(e.target.value)} />;
+}
+
+// ❌ 错误：在渲染时创建 debounced 函数（每次渲染新实例，防抖失效）
+function SearchInputBad() {
+  const handleSearch = debounce((value) => fetchResults(value), 300); // 每次渲染都重建！
+  return <input onChange={(e) => handleSearch(e.target.value)} />;
+}
+```
+
+### 7. 表单事件：受控 vs onChange 的特殊性
+
+```javascript
+// React 的 onChange 实际上对应原生的 oninput（实时触发），
+// 而不是原生的 onchange（失焦后触发）
+
+// ❌ 原生 onchange：只在 input 失去焦点时触发
+<input onchange="handleChange(this.value)" />
+
+// ✅ React onChange：每次键入都触发（等同于原生 oninput）
+function ControlledInput() {
+  const [value, setValue] = useState('');
+  return (
+    <input
+      value={value}
+      onChange={(e) => setValue(e.target.value)} // 实时触发
+    />
+  );
+}
+
+// 特殊情况：中文输入法（IME）composition 事件
+function CompositionAwareInput() {
+  const [value, setValue] = useState('');
+  const [isComposing, setIsComposing] = useState(false);
+
+  return (
+    <input
+      value={value}
+      onChange={(e) => {
+        // 输入中文拼音时，isComposing=true，不触发搜索
+        if (!isComposing) handleSearch(e.target.value);
+        setValue(e.target.value);
+      }}
+      onCompositionStart={() => setIsComposing(true)}
+      onCompositionEnd={(e) => {
+        setIsComposing(false);
+        handleSearch((e.target as HTMLInputElement).value);
+      }}
+    />
+  );
+}
+```
+
+## 进阶追问
+
+### React 合成事件源码简化实现
+
+```javascript
+// React 内部：事件插件系统（简化）
+const eventRegistry = new Map();
+
+// 注册事件插件
+function registerEvents() {
+  // onClick → click（冒泡）
+  // onClickCapture → click（捕获）
+  eventRegistry.set('onClick', { nativeEvent: 'click', capture: false });
+  eventRegistry.set('onClickCapture', { nativeEvent: 'click', capture: true });
+  eventRegistry.set('onChange', { nativeEvent: 'input', capture: false });
+  // ... 更多事件
+}
+
+// root 上的统一监听器
+function createEventListener(root) {
+  root.addEventListener('click', (nativeEvent) => {
+    // 1. 从 nativeEvent.target 开始，沿 Fiber 树向上收集 onClick 处理器
+    const handlers = collectHandlers(nativeEvent.target, 'onClick');
+
+    // 2. 创建合成事件对象
+    const syntheticEvent = createSyntheticEvent(nativeEvent);
+
+    // 3. 模拟冒泡：从内到外依次执行
+    for (const handler of handlers) {
+      if (syntheticEvent.isPropagationStopped()) break;
+      handler(syntheticEvent);
+    }
+  });
+}
+```
+
+### 为什么不能在循环里加事件监听但可以在 JSX 里？
+
+```javascript
+// JSX 中给列表元素加 onClick 是完全 OK 的
+// React 通过事件委托，实际只在 root 添加一个监听器
+// 无论列表有多少元素，都不会增加 DOM 监听器数量
+
+function List({ items }) {
+  return (
+    <ul>
+      {items.map((item) => (
+        // ✅ 没有性能问题：所有点击都委托到 root 上的同一个监听器
+        <li key={item.id} onClick={() => handleClick(item.id)}>
+          {item.name}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+// 相比之下，原生 JS 给每个 li 添加监听器才会有性能问题：
+// ❌ items.forEach(item => li.addEventListener('click', handler))
+// ✅ 原生也推荐事件委托：ul.addEventListener('click', e => { if(e.target.tagName === 'LI') ... })
+```

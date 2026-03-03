@@ -1,90 +1,383 @@
 ---
-title: "React Fiber 架构深度解析"
-description: "Fiber 架构设计动机、工作原理、调度机制与并发模式"
+title: "React Fiber 与并发渲染深度解析"
+description: "Fiber 架构、双缓冲、Lane 优先级模型、并发特性原理"
 difficulty: "高级"
-tags: ["Fiber", "调度", "并发模式", "Reconciliation"]
+tags: ["Fiber", "并发渲染", "Lane", "Reconciliation", "调度器"]
 category: "react"
 order: 2
 ---
 
-## 核心概念
+## 为什么需要 Fiber？
 
-React Fiber 是 React 16 引入的新架构，将原来的递归不可中断的 Reconciliation 改造为**可中断的异步渲染**。
+React 15 使用递归的 **Stack Reconciler**，一旦开始 diff 就无法中断。当组件树很深时，主线程长时间被占用，导致：
+- 动画掉帧（帧率 < 60fps）
+- 用户输入响应延迟
+- 页面感觉"卡顿"
 
-### 为什么需要 Fiber？
+Fiber 的目标：将渲染工作拆成**可中断的小单元**，让浏览器有机会处理高优先级任务。
 
-React 15 的 Stack Reconciler 使用递归遍历虚拟 DOM，一旦开始就无法中断，如果组件树很深，会长时间占用主线程，导致动画卡顿、用户交互无响应。
+## Fiber 节点结构
 
-### Fiber 节点结构
-
-每个 Fiber 节点是一个普通 JavaScript 对象：
+每个 React 元素对应一个 Fiber 节点，通过链表连接整棵树：
 
 ```javascript
 {
-  tag: WorkTag,         // 组件类型
+  // 节点身份
+  tag: WorkTag,           // 组件类型（函数组件/类组件/Host等）
   key: null | string,
-  type: any,            // 组件函数/类
-  stateNode: any,       // DOM 节点或类实例
-  return: Fiber | null, // 父 Fiber
-  child: Fiber | null,  // 第一个子 Fiber
-  sibling: Fiber | null,// 下一个兄弟 Fiber
-  alternate: Fiber | null, // 双缓冲
-  effectTag: SideEffectTag,
-  memoizedState: any,   // Hooks 链表
+  type: any,              // 组件函数 或 DOM 标签字符串
+  stateNode: any,         // 真实 DOM 节点 或 类组件实例
+
+  // 树结构（三叉链表，非递归遍历）
+  return: Fiber | null,   // 父节点
+  child: Fiber | null,    // 第一个子节点
+  sibling: Fiber | null,  // 下一个兄弟节点
+
+  // 双缓冲
+  alternate: Fiber | null, // 指向另一棵树的对应节点
+
+  // 状态与副作用
+  memoizedState: any,     // Hooks 链表 / 类组件 state
+  memoizedProps: any,
+  pendingProps: any,
+  flags: Flags,           // 副作用标记（Placement/Update/Deletion）
+  subtreeFlags: Flags,
+
+  // 调度
+  lanes: Lanes,           // 本节点的优先级
+  childLanes: Lanes,      // 子树优先级
 }
 ```
 
 ## 高频面试题
 
-### 1. Fiber 的工作流程
+### 1. Fiber 的遍历算法
 
-**两个阶段：**
-
-1. **Render 阶段（可中断）**：遍历 Fiber 树，收集变更（Side Effects），不涉及 DOM 操作
-2. **Commit 阶段（不可中断）**：将 Side Effects 同步应用到 DOM
+Fiber 用**深度优先 + 链表**替代递归调用栈，遍历可随时中断：
 
 ```text
-beginWork → 深度优先遍历子节点
-completeWork → 回溯创建 DOM / 收集 Effects
-commitWork → 同步提交到真实 DOM
+遍历顺序（performUnitOfWork）：
+
+       A
+      / \
+     B   C
+    / \
+   D   E
+
+1. beginWork(A) → 向下
+2. beginWork(B) → 向下
+3. beginWork(D) → 无子节点
+4. completeWork(D) → 找 sibling
+5. beginWork(E) → 无子节点
+6. completeWork(E) → 无 sibling，回到 return
+7. completeWork(B) → 找 sibling
+8. beginWork(C) → 无子节点
+9. completeWork(C) → 无 sibling，回到 return
+10. completeWork(A) → 完成
 ```
 
-### 2. 时间切片（Time Slicing）
+每处理完一个节点检查：**是否还有剩余时间**（`shouldYield()`）。没有则暂停，等下一帧继续。
 
-Fiber 通过 `requestIdleCallback`（实际使用 `MessageChannel`）实现时间切片：
+### 2. 双缓冲机制（Double Buffering）
 
-- 每个工作单元处理一个 Fiber 节点
-- 处理完后检查是否还有剩余时间
-- 如果时间不够，让出主线程，下一帧继续
+React 同时维护**两棵 Fiber 树**：
 
-### 3. 双缓冲机制
+- **current 树**：当前渲染到屏幕上的内容
+- **workInProgress 树**：后台正在构建的新树
 
-React 维护两棵 Fiber 树：
-- **current 树**：当前屏幕上显示的内容
-- **workInProgress 树**：正在构建的新树
+```text
+首次渲染：
+  null ← fiberRoot.current
+  构建 workInProgress 树 → commit → current 指向它
 
-构建完成后，通过指针切换将 workInProgress 变为 current，实现无闪烁更新。
+更新时：
+  current 树 ← fiberRoot.current
+  以 current 为基础，创建 workInProgress 树（复用节点）
+  commit 后，两树互换角色
+```
+
+好处：构建过程不影响当前显示；出错可回退；节点内存复用。
+
+### 3. Lane 优先级模型
+
+React 18 用 **Lane**（二进制位掩码）表示优先级，支持批量处理同优先级任务：
+
+```javascript
+// 优先级从高到低（部分）
+const SyncLane            = 0b0000000000000000000000000000001; // 同步（不可中断）
+const InputContinuousLane = 0b0000000000000000000000000000100; // 连续输入
+const DefaultLane         = 0b0000000000000000000000000010000; // 普通更新
+const TransitionLane1     = 0b0000000000000000000000001000000; // startTransition
+const IdleLane            = 0b0100000000000000000000000000000; // 空闲
+```
+
+位操作让优先级合并/比较极其高效：
+
+```javascript
+// 判断是否包含某优先级
+const includesSomeLane = (a, b) => (a & b) !== 0;
+
+// 合并优先级
+const mergeLanes = (a, b) => a | b;
+
+// 移除优先级
+const removeLanes = (set, subset) => set & ~subset;
+```
+
+### 4. Reconciliation（Diff 算法）核心规则
+
+React 的 Diff 基于三个假设：
+
+1. **同层比较**：不跨层级移动节点
+2. **类型不同直接替换**：`<div>` → `<span>` 不复用
+3. **key 标识稳定性**：列表必须有稳定的 key
+
+```javascript
+// key 的重要性
+// ❌ 用 index 做 key，会导致错误复用
+{items.map((item, index) => <Item key={index} data={item} />)}
+
+// ✅ 用唯一 ID
+{items.map((item) => <Item key={item.id} data={item} />)}
+```
+
+## 并发特性
+
+### startTransition：区分紧急/非紧急更新
+
+```javascript
+function SearchPage() {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState([]);
+  const [isPending, startTransition] = useTransition();
+
+  function handleChange(e) {
+    // 紧急：立即更新输入框
+    setQuery(e.target.value);
+
+    // 非紧急：可被打断的搜索结果更新
+    startTransition(() => {
+      setResults(heavySearch(e.target.value));
+    });
+  }
+
+  return (
+    <>
+      <input value={query} onChange={handleChange} />
+      {isPending ? <Spinner /> : <ResultList results={results} />}
+    </>
+  );
+}
+```
+
+### Suspense 与并发渲染
+
+```javascript
+// React 18：Suspense 配合 use() / lazy() 实现流式渲染
+function App() {
+  return (
+    <Suspense fallback={<PageSkeleton />}>
+      <Suspense fallback={<CommentsSkeleton />}>
+        <Comments />    {/* 可以单独 suspend */}
+      </Suspense>
+      <Suspense fallback={<SidebarSkeleton />}>
+        <Sidebar />     {/* 各自独立加载 */}
+      </Suspense>
+    </Suspense>
+  );
+}
+```
 
 ## 深入追问
 
-### React 的优先级调度
+### React 调度器（Scheduler）如何实现时间切片？
 
-React 18 使用 Lane 模型管理优先级：
-- **SyncLane**：同步更新（用户输入）
-- **InputContinuousLane**：连续输入（滚动）
-- **DefaultLane**：默认优先级
-- **TransitionLane**：过渡更新（startTransition）
-- **IdleLane**：空闲更新
-
-### useTransition 和 useDeferredValue
+React 没有用 `requestIdleCallback`（兼容性差、最小 50ms 延迟），而是用 **`MessageChannel`** 模拟：
 
 ```javascript
-// useTransition：标记低优先级更新
-const [isPending, startTransition] = useTransition();
-startTransition(() => {
-  setSearchResults(heavyComputation(input));
-});
+const channel = new MessageChannel();
+const port = channel.port2;
 
-// useDeferredValue：延迟值更新
-const deferredQuery = useDeferredValue(query);
+channel.port1.onmessage = performWorkUntilDeadline;
+
+function scheduleWork() {
+  port.postMessage(null); // 触发宏任务，在下一帧开始前执行
+}
+
+function performWorkUntilDeadline() {
+  const deadline = currentTime + 5; // 每帧最多执行 5ms
+  while (workQueue.length && currentTime < deadline) {
+    performNextWork();
+  }
+  if (workQueue.length) scheduleWork(); // 还有任务，下帧继续
+}
+```
+
+### React 19 的编译器（React Compiler）
+
+React Compiler（原 React Forget）自动插入 `useMemo`/`useCallback`，开发者无需手动优化：
+
+```javascript
+// 你写的代码
+function Component({ list }) {
+  const sorted = list.sort((a, b) => b - a);
+  return <List items={sorted} />;
+}
+
+// 编译器自动转换（等价于）
+function Component({ list }) {
+  const sorted = useMemo(() => list.sort((a, b) => b - a), [list]);
+  return <List items={sorted} />;
+}
+```
+
+## 进阶面试题
+
+### 5. 多节点 Diff 算法（列表更新）
+
+单节点 Diff 简单，难点在**多节点**列表的高效更新。React 采用**两轮遍历**：
+
+**第一轮：从左到右，处理顺序未变的常见情况**
+
+```text
+old: A → B → C → D
+new: A → B → E → D
+
+逐个对比（key + type 均相同才复用）：
+- A vs A → 复用 ✅
+- B vs B → 复用 ✅
+- C vs E → key 不同 → 停止第一轮
+```
+
+**第二轮：处理位置变动的节点**
+
+```text
+将剩余 oldFibers (C, D) 放入 Map<key, Fiber>
+继续遍历剩余 newElements：
+- E：Map 中无 key=E → 新建
+- D：Map 中有 key=D → 复用，从 Map 删除
+
+遍历结束，Map 中仍剩余 C → 标记删除
+```
+
+**lastPlacedIndex 优化（判断节点是否需要移动）**
+
+```text
+规则：记录上一个"不需要移动"节点在旧树中的 index (lastPlacedIndex)
+      当前节点的 oldIndex < lastPlacedIndex → 需要移动
+      否则 → 不移动，更新 lastPlacedIndex
+
+例：old: A(0) B(1) C(2) D(3)  →  new: D A B C
+- D: oldIndex=3 >= lastPlacedIndex=0 → 不移动，lastPlacedIndex=3
+- A: oldIndex=0 < 3 → 移动
+- B: oldIndex=1 < 3 → 移动
+- C: oldIndex=2 < 3 → 移动
+
+结论：DOM 操作 = D 不动，ABC 移动到 D 后面（3次 DOM 操作）
+```
+
+> ⚠️ 这就是为什么"将末尾元素移到开头"代价远高于"将开头元素移到末尾"——前者导致其余所有节点都需要移动。
+
+### 6. StrictMode 为何双重调用 Effects？
+
+```tsx
+// StrictMode 在开发环境故意执行两次：
+// mount → unmount → mount（模拟组件快速挂载/卸载）
+// 目的：暴露没有正确清理副作用的问题
+
+// ❌ StrictMode 下会创建两个 WebSocket 连接
+useEffect(() => {
+  const ws = new WebSocket('wss://...');
+  ws.onmessage = handleMessage;
+  // 缺少清理函数 → 第二次 mount 时旧连接未关闭
+}, []);
+
+// ✅ 始终返回清理函数，StrictMode 验证清理是否正确
+useEffect(() => {
+  const ws = new WebSocket('wss://...');
+  ws.onmessage = handleMessage;
+  return () => ws.close();
+}, []);
+```
+
+双重调用**只在开发模式**发生，生产环境不受影响。如果在 StrictMode 下行为异常，说明副作用逻辑有缺陷，需要修复。
+
+受影响的 API：
+- `useEffect` / `useLayoutEffect`（会执行 setup → cleanup → setup）
+- 函数组件 render 函数（会调用两次，确保幂等）
+- `useState` / `useMemo` 的初始化函数
+
+### 7. Error Boundary 工作原理
+
+```tsx
+// 函数组件无法成为 Error Boundary，必须用类组件
+class ErrorBoundary extends React.Component<
+  { fallback: React.ReactNode; children: React.ReactNode },
+  { hasError: boolean; error: Error | null }
+> {
+  state = { hasError: false, error: null };
+
+  // 渲染阶段捕获错误，返回新 state（纯函数，不能有副作用）
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  // commit 阶段，可以记录日志（可以有副作用）
+  componentDidCatch(error: Error, info: React.ErrorInfo) {
+    console.error('ErrorBoundary caught:', error, info.componentStack);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return this.props.fallback;
+    }
+    return this.props.children;
+  }
+}
+```
+
+**Error Boundary 能捕获 vs 不能捕获的错误：**
+
+| 场景 | 是否捕获 |
+|------|---------|
+| 子组件渲染（render/函数体） | ✅ |
+| `useLayoutEffect` / `componentDidMount` | ✅ |
+| 事件处理函数 | ❌（需自行 try/catch） |
+| 异步代码（setTimeout、Promise） | ❌ |
+| Error Boundary 自身 | ❌ |
+| SSR | ❌ |
+
+```tsx
+// 用高阶函数封装，方便使用
+function withErrorBoundary<P extends object>(
+  Component: React.ComponentType<P>,
+  fallback: React.ReactNode
+) {
+  return function WrappedComponent(props: P) {
+    return (
+      <ErrorBoundary fallback={fallback}>
+        <Component {...props} />
+      </ErrorBoundary>
+    );
+  };
+}
+
+// 或使用 react-error-boundary 库（支持 resetKeys、onReset 等）
+import { ErrorBoundary } from 'react-error-boundary';
+
+function App() {
+  return (
+    <ErrorBoundary
+      fallbackRender={({ error, resetErrorBoundary }) => (
+        <div>
+          <p>出错了：{error.message}</p>
+          <button onClick={resetErrorBoundary}>重试</button>
+        </div>
+      )}
+      onError={(error, info) => logError(error, info)}
+    >
+      <ChildComponent />
+    </ErrorBoundary>
+  );
+}
 ```

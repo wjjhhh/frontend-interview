@@ -1,0 +1,411 @@
+---
+title: "前端单元测试实战"
+description: "Vitest/Jest 核心原理、React Testing Library 最佳实践、Mock 策略、测试自定义 Hook"
+difficulty: "中级"
+tags: ["单元测试", "Vitest", "Jest", "React Testing Library", "MSW", "Mock"]
+category: "engineering"
+order: 4
+---
+
+## 测试的核心原则
+
+```text
+测什么？
+  ✅ 组件行为（用户交互后的 DOM 变化）
+  ✅ 业务逻辑（函数输入输出）
+  ✅ 边界情况（空数据、错误状态）
+  ❌ 实现细节（state 内部值、私有方法）
+  ❌ 第三方库的行为（React 自己会保证）
+
+测试金字塔：
+         ／＼
+        / E2E \      少量（慢、成本高）
+       /───────\
+      / 集成测试 \    适量
+     /───────────\
+    /  单元测试    \  大量（快、成本低）
+   ─────────────────
+```
+
+## 高频面试题
+
+### 1. Vitest vs Jest：如何选择？
+
+```text
+Jest（Meta 出品）                   Vitest（Vite 生态）
+────────────────────                ──────────────────────────
+需要额外配置 Babel/ts-jest           原生支持 ESM / TypeScript
+启动较慢（JIT 转换）                 复用 Vite 配置，启动极快
+社区庞大，插件丰富                   API 与 Jest 完全兼容（可迁移）
+适合非 Vite 项目                    适合 Vite / Next.js 项目
+```
+
+```typescript
+// vitest.config.ts（Vite 项目）
+import { defineConfig } from 'vitest/config';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  test: {
+    environment: 'jsdom',         // 模拟浏览器 DOM 环境
+    globals: true,                // 无需 import describe/it/expect
+    setupFiles: './src/test/setup.ts',
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'lcov'],
+      exclude: ['node_modules', 'src/test'],
+    },
+  },
+});
+
+// src/test/setup.ts
+import '@testing-library/jest-dom'; // 扩展 expect 的 DOM 匹配器
+```
+
+### 2. React Testing Library 核心思想
+
+**测试用户行为，而非组件实现。**
+
+```tsx
+// ❌ 酶式测试（Enzyme 风格）：测试实现细节
+const wrapper = shallow(<Counter />);
+expect(wrapper.state('count')).toBe(0);        // 直接访问 state
+wrapper.find('button').simulate('click');
+expect(wrapper.state('count')).toBe(1);        // 还是 state
+
+// ✅ RTL 风格：测试用户能看到/操作的东西
+import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+
+test('计数器点击后数字增加', async () => {
+  const user = userEvent.setup();
+  render(<Counter />);
+
+  // 用户能看到的：屏幕上的文字
+  expect(screen.getByText('0')).toBeInTheDocument();
+
+  // 用户能做的：点击按钮
+  await user.click(screen.getByRole('button', { name: '+1' }));
+
+  // 用户能看到的结果
+  expect(screen.getByText('1')).toBeInTheDocument();
+});
+```
+
+### 3. 查询方法的优先级
+
+RTL 提供多种 `getBy*` 方法，优先级从高到低：
+
+```typescript
+// 优先级 1：语义化角色（无障碍优先）
+screen.getByRole('button', { name: '提交' })
+screen.getByRole('textbox', { name: '用户名' })
+screen.getByRole('heading', { name: /欢迎/i })
+
+// 优先级 2：语义化标签/属性
+screen.getByLabelText('邮箱')        // <label> 关联的 input
+screen.getByPlaceholderText('搜索')
+screen.getByAltText('用户头像')      // <img alt="">
+
+// 优先级 3：文本内容
+screen.getByText('保存成功')
+screen.getByText(/^\d+$/)            // 正则
+
+// 优先级 4：测试 ID（最后手段）
+screen.getByTestId('submit-btn')     // data-testid="submit-btn"
+// ⚠️ 仅当无法用语义方式查询时才用
+
+// 查询变体：
+// getBy*    → 找不到或找到多个：抛出错误（断言存在）
+// queryBy*  → 找不到返回 null（断言不存在时用）
+// findBy*   → 异步版本，等待元素出现（返回 Promise）
+// getAllBy*  → 返回数组
+
+// 典型用法对比：
+expect(screen.queryByText('错误提示')).not.toBeInTheDocument(); // 断言不存在
+const el = await screen.findByText('加载完成');                  // 等待出现
+```
+
+### 4. 测试异步行为
+
+```tsx
+// 组件：提交表单后显示成功消息
+function LoginForm() {
+  const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setStatus('loading');
+    try {
+      await login({ email: '...', password: '...' });
+      setStatus('success');
+    } catch {
+      setStatus('error');
+    }
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input name="email" type="email" placeholder="邮箱" />
+      <input name="password" type="password" placeholder="密码" />
+      <button type="submit">登录</button>
+      {status === 'loading' && <p>登录中...</p>}
+      {status === 'success' && <p>登录成功！</p>}
+      {status === 'error' && <p>登录失败</p>}
+    </form>
+  );
+}
+
+// 测试
+import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { vi } from 'vitest';
+import * as api from './api';
+
+test('登录成功后显示成功消息', async () => {
+  // Mock API
+  vi.spyOn(api, 'login').mockResolvedValue({ token: 'abc123' });
+
+  const user = userEvent.setup();
+  render(<LoginForm />);
+
+  await user.type(screen.getByPlaceholderText('邮箱'), 'test@example.com');
+  await user.type(screen.getByPlaceholderText('密码'), 'password123');
+  await user.click(screen.getByRole('button', { name: '登录' }));
+
+  // 等待异步状态更新
+  expect(await screen.findByText('登录成功！')).toBeInTheDocument();
+  expect(api.login).toHaveBeenCalledWith({
+    email: 'test@example.com',
+    password: 'password123',
+  });
+});
+
+test('登录失败时显示错误', async () => {
+  vi.spyOn(api, 'login').mockRejectedValue(new Error('Invalid credentials'));
+
+  const user = userEvent.setup();
+  render(<LoginForm />);
+
+  await user.click(screen.getByRole('button', { name: '登录' }));
+
+  // waitFor：等待条件成立（适合不知道确切时机时）
+  await waitFor(() => {
+    expect(screen.getByText('登录失败')).toBeInTheDocument();
+  });
+});
+```
+
+### 5. Mock 策略
+
+```typescript
+// ① vi.mock：模块级 Mock（在文件顶部，自动提升）
+vi.mock('./api', () => ({
+  fetchUser: vi.fn().mockResolvedValue({ id: 1, name: 'Alice' }),
+  updateUser: vi.fn().mockResolvedValue({ success: true }),
+}));
+
+// ② vi.spyOn：监听并替换单个函数
+const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+// 恢复原始实现
+spy.mockRestore();
+
+// ③ Mock 模块工厂函数（带类型）
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({
+    push: vi.fn(),
+    replace: vi.fn(),
+    back: vi.fn(),
+  }),
+  usePathname: () => '/dashboard',
+  useSearchParams: () => new URLSearchParams(),
+}));
+
+// ④ Mock 环境变量
+vi.stubEnv('NEXT_PUBLIC_API_URL', 'https://test-api.example.com');
+
+// ⑤ 每个测试前后重置
+beforeEach(() => {
+  vi.clearAllMocks();  // 清除调用记录，保留 mock 实现
+});
+afterEach(() => {
+  vi.restoreAllMocks(); // 恢复所有 spyOn
+});
+```
+
+### 6. MSW：拦截真实 HTTP 请求
+
+MSW（Mock Service Worker）拦截网络层，比 mock 函数更真实：
+
+```typescript
+// src/test/handlers.ts
+import { http, HttpResponse } from 'msw';
+
+export const handlers = [
+  // GET /api/users/:id
+  http.get('/api/users/:id', ({ params }) => {
+    if (params.id === '404') {
+      return HttpResponse.json({ error: 'Not Found' }, { status: 404 });
+    }
+    return HttpResponse.json({ id: params.id, name: 'Alice', email: 'alice@example.com' });
+  }),
+
+  // POST /api/posts
+  http.post('/api/posts', async ({ request }) => {
+    const body = await request.json() as { title: string };
+    return HttpResponse.json({ id: Date.now(), ...body }, { status: 201 });
+  }),
+];
+
+// src/test/setup.ts
+import { setupServer } from 'msw/node';
+import { handlers } from './handlers';
+
+export const server = setupServer(...handlers);
+
+beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+afterEach(() => server.resetHandlers()); // 每个测试后重置，防止污染
+afterAll(() => server.close());
+
+// 在特定测试中覆盖 handler
+test('处理 404 错误', async () => {
+  server.use(
+    http.get('/api/users/999', () =>
+      HttpResponse.json({ error: 'Not Found' }, { status: 404 })
+    )
+  );
+  // ...测试 404 场景
+});
+```
+
+### 7. 测试自定义 Hook
+
+```typescript
+import { renderHook, act } from '@testing-library/react';
+
+// 被测 Hook
+function useCounter(initial = 0) {
+  const [count, setCount] = useState(initial);
+  const increment = useCallback(() => setCount(c => c + 1), []);
+  const decrement = useCallback(() => setCount(c => c - 1), []);
+  const reset = useCallback(() => setCount(initial), [initial]);
+  return { count, increment, decrement, reset };
+}
+
+// 测试
+test('useCounter 基本功能', () => {
+  const { result } = renderHook(() => useCounter(5));
+
+  expect(result.current.count).toBe(5);
+
+  act(() => result.current.increment());
+  expect(result.current.count).toBe(6);
+
+  act(() => result.current.decrement());
+  act(() => result.current.decrement());
+  expect(result.current.count).toBe(4);
+
+  act(() => result.current.reset());
+  expect(result.current.count).toBe(5);
+});
+
+// 测试依赖 Context 的 Hook
+test('useTheme 读取 ThemeContext', () => {
+  const wrapper = ({ children }: { children: React.ReactNode }) => (
+    <ThemeProvider defaultTheme="dark">{children}</ThemeProvider>
+  );
+
+  const { result } = renderHook(() => useTheme(), { wrapper });
+  expect(result.current.theme).toBe('dark');
+
+  act(() => result.current.setTheme('light'));
+  expect(result.current.theme).toBe('light');
+});
+```
+
+### 8. 快照测试（Snapshot Testing）
+
+```typescript
+// 快照测试：记录 UI 结构，防止意外改动
+test('Button 组件快照', () => {
+  const { container } = render(
+    <Button variant="primary" size="sm">提交</Button>
+  );
+  expect(container).toMatchSnapshot();
+  // 首次运行：生成 __snapshots__/Button.test.tsx.snap
+  // 后续运行：与快照对比，不一致则报错
+});
+
+// 更新快照（UI 有意变更时）：
+// vitest --update-snapshots
+// jest --updateSnapshot
+
+// ⚠️ 快照测试的陷阱：
+// - 快照文件需要提交到 git
+// - 不要对动态内容（时间戳、随机 ID）做快照
+// - 快照过大会降低可读性，优先用精确断言
+
+// 内联快照（更易读）
+test('错误提示样式', () => {
+  render(<Alert type="error" message="出错了" />);
+  expect(screen.getByRole('alert')).toMatchInlineSnapshot(`
+    <div
+      class="alert alert-error"
+      role="alert"
+    >
+      出错了
+    </div>
+  `);
+});
+```
+
+## 深入追问
+
+### 如何测试 Context Provider？
+
+```tsx
+// 封装通用 render 工具，自动包裹 Provider
+import { render, RenderOptions } from '@testing-library/react';
+
+function AllTheProviders({ children }: { children: React.ReactNode }) {
+  return (
+    <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+      <ThemeProvider>
+        <AuthProvider>
+          {children}
+        </AuthProvider>
+      </ThemeProvider>
+    </QueryClientProvider>
+  );
+}
+
+// 自定义 render，替代 RTL 默认的 render
+const customRender = (ui: React.ReactElement, options?: RenderOptions) =>
+  render(ui, { wrapper: AllTheProviders, ...options });
+
+export { customRender as render };
+export * from '@testing-library/react';
+
+// 使用：与普通 render 一样，但自动有所有 Provider
+import { render, screen } from './test-utils';
+test('...', () => {
+  render(<MyComponent />); // ✅ 自动包裹所有 Provider
+});
+```
+
+### 覆盖率指标解读
+
+```text
+行覆盖率（Line Coverage）：代码行是否被执行
+分支覆盖率（Branch Coverage）：if/else 每个分支是否都测到 ← 更重要
+函数覆盖率（Function Coverage）：每个函数是否被调用
+语句覆盖率（Statement Coverage）：每条语句是否执行
+
+目标：分支覆盖率 > 80%（行覆盖率 100% 也可能漏掉分支）
+
+// 忽略不需要测试的代码
+/* istanbul ignore next */    // Jest/Istanbul
+/* v8 ignore next */          // Vitest v8 provider
+function devOnlyHelper() { ... }
+```

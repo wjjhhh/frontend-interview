@@ -1,0 +1,401 @@
+---
+title: "前端接入 AI：流式响应与 Tool Calling"
+description: "SSE 流式响应原理、Vercel AI SDK 用法、Tool Calling 实现、前端 AI 交互模式"
+difficulty: "高级"
+tags: ["流式响应", "SSE", "Tool Calling", "Vercel AI SDK", "AI SDK", "fetch stream", "LLM"]
+category: "ai-agent"
+order: 2
+---
+
+## 为什么 AI 响应需要流式输出？
+
+LLM 生成文本是逐 token 产生的，如果等全部生成完再返回：
+
+```text
+等待完整响应：用户盯着空白屏等 5~30 秒 → 体验极差
+
+流式响应（Streaming）：
+  token1 → token2 → token3 → ... → 逐字呈现
+  首字延迟 < 1s → 用户感知"实时生成" → 体验大幅提升
+```
+
+## 高频面试题
+
+### 1. SSE（Server-Sent Events）原理
+
+流式 AI 响应通常基于 SSE 实现：
+
+```text
+HTTP 普通请求：  请求 → 等待 → 完整响应（一次性）
+SSE：           请求 → 服务器持续推送数据块 → 客户端逐块处理
+```
+
+```javascript
+// 服务端（Next.js Route Handler）
+export async function POST(req) {
+  const { messages } = await req.json();
+
+  // 创建 ReadableStream
+  const stream = new ReadableStream({
+    async start(controller) {
+      const encoder = new TextEncoder();
+
+      // 调用 LLM API（以 Anthropic 为例）
+      const response = await anthropic.messages.create({
+        model: 'claude-sonnet-4-6',
+        messages,
+        stream: true,
+        max_tokens: 1024,
+      });
+
+      for await (const chunk of response) {
+        if (chunk.type === 'content_block_delta') {
+          const text = chunk.delta.text;
+          // SSE 格式：data: <内容>\n\n
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text })}\n\n`));
+        }
+      }
+
+      controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    },
+  });
+}
+```
+
+```javascript
+// 客户端：消费 SSE 流
+async function streamChat(messages, onChunk) {
+  const response = await fetch('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages }),
+  });
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    // 解析 SSE 数据
+    const text = decoder.decode(value);
+    const lines = text.split('\n').filter(line => line.startsWith('data: '));
+
+    for (const line of lines) {
+      const data = line.slice(6); // 去掉 "data: "
+      if (data === '[DONE]') return;
+
+      const { text: chunk } = JSON.parse(data);
+      onChunk(chunk); // 逐块更新 UI
+    }
+  }
+}
+
+// React 中使用
+function ChatMessage() {
+  const [content, setContent] = useState('');
+
+  const handleSend = async (userMessage) => {
+    setContent('');
+    await streamChat(
+      [{ role: 'user', content: userMessage }],
+      (chunk) => setContent(prev => prev + chunk)
+    );
+  };
+}
+```
+
+---
+
+### 2. Vercel AI SDK（推荐方案）
+
+[Vercel AI SDK](https://sdk.vercel.ai) 封装了流式响应、工具调用等复杂逻辑：
+
+```bash
+npm install ai @ai-sdk/anthropic
+```
+
+```typescript
+// app/api/chat/route.ts（服务端）
+import { anthropic } from '@ai-sdk/anthropic';
+import { streamText, tool } from 'ai';
+import { z } from 'zod';
+
+export async function POST(req: Request) {
+  const { messages } = await req.json();
+
+  const result = streamText({
+    model: anthropic('claude-sonnet-4-6'),
+    messages,
+    tools: {
+      // 定义工具（LLM 可以调用）
+      getWeather: tool({
+        description: '获取指定城市的天气信息',
+        parameters: z.object({
+          city: z.string().describe('城市名称'),
+        }),
+        execute: async ({ city }) => {
+          // 实际调用天气 API
+          return { city, temperature: 28, weather: '晴天' };
+        },
+      }),
+    },
+  });
+
+  // 返回 AI SDK 标准流格式
+  return result.toDataStreamResponse();
+}
+```
+
+```typescript
+// app/page.tsx（客户端）
+'use client';
+import { useChat } from 'ai/react';
+
+export default function Chat() {
+  const { messages, input, handleInputChange, handleSubmit, isLoading } = useChat({
+    api: '/api/chat',
+  });
+
+  return (
+    <div>
+      {messages.map(msg => (
+        <div key={msg.id}>
+          <strong>{msg.role}：</strong>
+          {/* 渲染文本内容 */}
+          {msg.content}
+          {/* 渲染工具调用结果 */}
+          {msg.toolInvocations?.map(tool => (
+            <div key={tool.toolCallId}>
+              调用工具：{tool.toolName}
+              {tool.state === 'result' && <pre>{JSON.stringify(tool.result)}</pre>}
+            </div>
+          ))}
+        </div>
+      ))}
+
+      <form onSubmit={handleSubmit}>
+        <input value={input} onChange={handleInputChange} placeholder="输入消息..." />
+        <button type="submit" disabled={isLoading}>发送</button>
+      </form>
+    </div>
+  );
+}
+```
+
+---
+
+### 3. Tool Calling 原理
+
+Tool Calling（函数调用）让 LLM 能够请求执行外部函数：
+
+```text
+完整流程：
+
+① 客户端向 LLM 发送消息 + 工具定义
+   {
+     messages: [...],
+     tools: [
+       {
+         name: "search_web",
+         description: "搜索互联网",
+         parameters: { query: { type: "string" } }
+       }
+     ]
+   }
+
+② LLM 决定调用工具（返回结构化的 tool_use）
+   {
+     role: "assistant",
+     content: [{
+       type: "tool_use",
+       id: "call_abc",
+       name: "search_web",
+       input: { query: "今日 A 股行情" }
+     }]
+   }
+
+③ 客户端执行工具，将结果返回给 LLM
+   {
+     role: "user",
+     content: [{
+       type: "tool_result",
+       tool_use_id: "call_abc",
+       content: "上证指数今日涨 0.5%，收于 3120 点"
+     }]
+   }
+
+④ LLM 根据工具结果生成最终回答
+```
+
+```typescript
+// 手动实现 Tool Calling 循环（不用 SDK）
+async function runWithTools(userMessage: string) {
+  const tools = [
+    {
+      name: 'calculate',
+      description: '执行数学计算',
+      input_schema: {
+        type: 'object',
+        properties: {
+          expression: { type: 'string', description: '数学表达式' },
+        },
+        required: ['expression'],
+      },
+    },
+  ];
+
+  const messages = [{ role: 'user', content: userMessage }];
+
+  // 最多循环 10 次（防止无限调用）
+  for (let i = 0; i < 10; i++) {
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 1024,
+      tools,
+      messages,
+    });
+
+    messages.push({ role: 'assistant', content: response.content });
+
+    if (response.stop_reason === 'end_turn') {
+      // LLM 决定不再调用工具，任务完成
+      return response.content.find(b => b.type === 'text')?.text;
+    }
+
+    if (response.stop_reason === 'tool_use') {
+      // 执行所有工具调用
+      const toolResults = [];
+      for (const block of response.content) {
+        if (block.type !== 'tool_use') continue;
+
+        let result;
+        if (block.name === 'calculate') {
+          // 安全地执行表达式（实际项目用 mathjs 等库）
+          result = String(eval(block.input.expression));
+        }
+
+        toolResults.push({
+          type: 'tool_result',
+          tool_use_id: block.id,
+          content: result,
+        });
+      }
+      messages.push({ role: 'user', content: toolResults });
+    }
+  }
+}
+```
+
+---
+
+### 4. 前端 AI 交互常见模式
+
+#### 对话式（Chat）
+
+```typescript
+// 维护多轮对话历史
+const [messages, setMessages] = useState<Message[]>([]);
+
+const sendMessage = async (content: string) => {
+  const newMessages = [...messages, { role: 'user', content }];
+  setMessages(newMessages);
+
+  // 追加 AI 回复占位
+  setMessages(prev => [...prev, { role: 'assistant', content: '' }]);
+
+  await streamChat(newMessages, (chunk) => {
+    setMessages(prev => {
+      const last = prev[prev.length - 1];
+      return [...prev.slice(0, -1), { ...last, content: last.content + chunk }];
+    });
+  });
+};
+```
+
+#### 自动补全（Autocomplete / Copilot）
+
+```typescript
+// 监听输入，防抖后请求补全建议
+const [suggestion, setSuggestion] = useState('');
+const debouncedValue = useDebounce(inputValue, 500);
+
+useEffect(() => {
+  if (!debouncedValue) return;
+  fetchCompletion(debouncedValue).then(setSuggestion);
+}, [debouncedValue]);
+
+// Tab 键接受补全
+const handleKeyDown = (e: KeyboardEvent) => {
+  if (e.key === 'Tab' && suggestion) {
+    e.preventDefault();
+    setInputValue(inputValue + suggestion);
+    setSuggestion('');
+  }
+};
+```
+
+#### 结构化输出（Structured Output）
+
+```typescript
+// 让 LLM 返回 JSON 格式的结果（用于解析后续使用）
+import { generateObject } from 'ai';
+import { z } from 'zod';
+
+const { object } = await generateObject({
+  model: anthropic('claude-sonnet-4-6'),
+  schema: z.object({
+    sentiment: z.enum(['positive', 'negative', 'neutral']),
+    score: z.number().min(0).max(1),
+    keywords: z.array(z.string()),
+    summary: z.string(),
+  }),
+  prompt: `分析以下评论的情感：${userReview}`,
+});
+
+// object 类型安全，可直接使用
+console.log(object.sentiment); // 'positive' | 'negative' | 'neutral'
+```
+
+---
+
+### 5. 中断与重试
+
+```typescript
+// 使用 AbortController 取消请求
+function useStreamChat() {
+  const abortRef = useRef<AbortController | null>(null);
+
+  const send = async (messages) => {
+    // 取消上一次请求
+    abortRef.current?.abort();
+    abortRef.current = new AbortController();
+
+    try {
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        body: JSON.stringify({ messages }),
+        signal: abortRef.current.signal, // 传入 signal
+      });
+      // ... 处理流
+    } catch (e) {
+      if (e.name === 'AbortError') return; // 用户主动取消，不报错
+      throw e;
+    }
+  };
+
+  const stop = () => abortRef.current?.abort();
+
+  return { send, stop };
+}
+```

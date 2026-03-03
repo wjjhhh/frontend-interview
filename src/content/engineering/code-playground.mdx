@@ -1,0 +1,349 @@
+---
+title: "实现一个浏览器端 React Playground"
+description: "iframe 沙箱隔离、@babel/standalone 运行时编译、动态代码执行安全、实时预览架构"
+difficulty: "高级"
+tags: ["代码执行", "iframe沙箱", "Babel", "系统设计", "安全"]
+category: "engineering"
+order: 3
+---
+
+## 面试题：如何实现一个在线代码执行器？
+
+这是一道综合面试题，考查对**浏览器安全模型、动态代码执行、编译原理**的理解。
+
+系统需要满足：
+- 用户在编辑器输入 JSX 代码
+- 浏览器端实时编译 + 渲染预览
+- 隔离执行环境（不能访问主页面数据）
+- 捕获运行时错误并展示
+
+## 整体架构
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  主页面（Next.js / React App）                               │
+│                                                             │
+│  ┌───────────────┐         ┌─────────────────────────────┐ │
+│  │  代码编辑器    │         │      iframe（隔离沙箱）       │ │
+│  │  <textarea>   │──构建──▶│                             │ │
+│  │  或 Monaco    │  srcdoc │  React + ReactDOM（CDN）     │ │
+│  └───────────────┘         │  @babel/standalone（CDN）   │ │
+│                            │                             │ │
+│  ① 用户输入 JSX            │  ② Babel 编译 JSX → JS     │ │
+│  ③ 防抖 600ms              │  ④ ReactDOM.createRoot 渲染 │ │
+│  ⑤ 更新 srcdoc             │  ⑥ 错误上报 window.onerror │ │
+│                            └─────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 高频面试题
+
+### 1. 为什么用 iframe 而不是直接 eval()？
+
+```javascript
+// ❌ 方案1：直接 eval（危险）
+eval(userCode);
+// 问题：
+// - 与主页面共享同一个 JS 执行上下文
+// - 用户代码可以访问/修改主页面的所有变量
+// - 无法隔离 localStorage、cookie、DOM 操作
+// - eval 的代码无法被 GC（内存泄漏）
+
+// ❌ 方案2：new Function（略好，但仍不安全）
+const fn = new Function('React', 'ReactDOM', userCode);
+fn(React, ReactDOM);
+// 仍然共享主页面 window，可以访问 document、fetch 等
+
+// ✅ 方案3：sandbox iframe（正确）
+// iframe 有独立的：
+// - window 对象
+// - document / DOM 树
+// - localStorage（同源时独立作用域）
+// - JS 执行上下文（主页面变量完全不可访问）
+// - 崩溃不影响主页面（子进程隔离）
+```
+
+### 2. srcdoc vs src：如何将代码注入 iframe？
+
+```html
+<!-- ❌ src 方案：需要服务器端接口 -->
+<iframe src="/api/preview?code=xxx"></iframe>
+<!-- 需要把代码发送给服务器，服务器返回 HTML，延迟高 -->
+
+<!-- ✅ srcdoc 方案：纯客户端，无需服务器 -->
+<iframe srcdoc="<!DOCTYPE html><html>...</html>"></iframe>
+<!-- 直接将 HTML 字符串设为 iframe 内容，零延迟 -->
+```
+
+```typescript
+// 构建 iframe 的完整 HTML
+function buildIframeSrc(userCode: string): string {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <!-- 在 iframe 内部加载 React + Babel，与主页面的 React 完全隔离 -->
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel" data-presets="react">
+    // 解构常用 Hooks，让用户代码无需 import
+    const { useState, useEffect, useRef, useMemo,
+            useCallback, useReducer } = React;
+
+    ${userCode}
+
+    // 约定：用户需要定义 App 组件作为入口
+    ReactDOM.createRoot(document.getElementById('root'))
+      .render(React.createElement(App));
+  </script>
+</body>
+</html>`;
+}
+```
+
+### 3. iframe sandbox 属性：最小权限原则
+
+```html
+<!-- sandbox 属性默认禁止一切，按需开放 -->
+<iframe
+  srcdoc="..."
+  sandbox="allow-scripts"
+  title="Code Preview"
+/>
+
+<!-- sandbox 各权限含义 -->
+<!--
+  allow-scripts       ← 允许执行 JS（必须开启，否则代码无法运行）
+  allow-same-origin   ← 允许访问同源资源（不开启则 localStorage 被禁）
+  allow-forms         ← 允许表单提交
+  allow-popups        ← 允许弹窗
+  allow-top-navigation ← 允许修改父页面 URL（危险！不开启）
+-->
+
+<!-- ⚠️ 注意：同时设置 allow-scripts + allow-same-origin 会削弱隔离 -->
+<!-- 因为脚本可以通过 parent.xxx 访问父页面 -->
+<!-- 纯代码演示场景只需 allow-scripts 即可 -->
+```
+
+### 4. @babel/standalone：浏览器端 JSX 编译原理
+
+```html
+<!-- type="text/babel" 告诉 Babel standalone 拦截并编译这段脚本 -->
+<script type="text/babel" data-presets="react">
+  const App = () => <h1>Hello</h1>;
+  // ↓ Babel 在运行时将其转换为：
+  // const App = () => React.createElement("h1", null, "Hello");
+  ReactDOM.createRoot(root).render(React.createElement(App));
+</script>
+```
+
+```javascript
+// 或者用 JS API 手动编译（更灵活）
+const result = Babel.transform(userCode, {
+  presets: ['react'],           // 编译 JSX
+  plugins: ['transform-modules-commonjs'], // 可选：CommonJS 模块
+  filename: 'playground.jsx',
+});
+
+const compiledCode = result.code;
+// 再通过 new Function 执行，或注入到 script 标签
+```
+
+**为什么不在主页面编译再传给 iframe？**
+
+```text
+方案A（主页面编译）：
+  主页面安装 @babel/core → 编译 JSX → 发 postMessage → iframe 执行
+  优点：主页面可用更强大的 Babel 配置
+  缺点：@babel/core 打包体积大（~1MB），需要 postMessage 通信
+
+方案B（iframe 内编译，本文采用）：
+  iframe 从 CDN 加载 @babel/standalone → 自行编译执行
+  优点：主页面零体积，架构简单
+  缺点：依赖 CDN，首次加载慢（可预加载缓解）
+```
+
+### 5. 错误处理：三层防护
+
+```typescript
+function buildIframeSrc(code: string): string {
+  return `...
+  <div id="error" style="display:none; color:red; padding:12px; font-family:monospace; white-space:pre-wrap;"></div>
+
+  <script>
+    // 第一层：全局未捕获错误（运行时 JS 错误）
+    window.addEventListener('error', function(e) {
+      var el = document.getElementById('error');
+      el.style.display = 'block';
+      el.textContent = e.error ? e.error.stack : e.message;
+    });
+
+    // 第二层：未处理的 Promise rejection
+    window.addEventListener('unhandledrejection', function(e) {
+      var el = document.getElementById('error');
+      el.style.display = 'block';
+      el.textContent = 'Unhandled Promise: ' + e.reason;
+    });
+  </script>
+
+  <script type="text/babel" data-presets="react">
+    // 第三层：try/catch 包裹渲染逻辑
+    try {
+      ${code}
+      ReactDOM.createRoot(document.getElementById('root'))
+        .render(React.createElement(App));
+    } catch(e) {
+      document.getElementById('error').style.display = 'block';
+      document.getElementById('error').textContent = e.toString();
+    }
+  </script>`;
+}
+```
+
+### 6. 实时预览：防抖 + 避免频繁重建 iframe
+
+```typescript
+// ❌ 每次 onChange 都更新 srcdoc：输入中途频繁重建 iframe，体验差
+function Editor() {
+  const [code, setCode] = useState('');
+  const [src, setSrc] = useState('');
+
+  return (
+    <textarea
+      onChange={(e) => {
+        setCode(e.target.value);
+        setSrc(buildIframeSrc(e.target.value)); // 每次按键都重建！
+      }}
+    />
+  );
+}
+
+// ✅ 防抖：停止输入 600ms 后再更新
+function Editor() {
+  const [code, setCode] = useState(defaultCode);
+  const [iframeSrc, setIframeSrc] = useState(() => buildIframeSrc(defaultCode));
+  const timerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+
+  const handleChange = useCallback((newCode: string) => {
+    setCode(newCode);
+    clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => {
+      setIframeSrc(buildIframeSrc(newCode)); // 停止输入后才重建
+    }, 600);
+  }, []);
+
+  useEffect(() => () => clearTimeout(timerRef.current), []); // 组件卸载清理
+
+  return (
+    <>
+      <textarea value={code} onChange={(e) => handleChange(e.target.value)} />
+      <iframe srcDoc={iframeSrc} sandbox="allow-scripts" />
+    </>
+  );
+}
+```
+
+### 7. 字符串注入安全：转义用户代码
+
+```typescript
+// 问题：用户代码中含有反引号 ` 或 ${} 会破坏模板字符串
+const userCode = 'const s = `hello ${name}`'; // 破坏外层模板！
+
+// ❌ 直接拼接（有注入风险）
+return `<script type="text/babel">${userCode}</script>`;
+
+// ✅ 方案1：转义特殊字符（模板字符串内）
+function buildIframeSrc(code: string): string {
+  const safe = code
+    .replace(/\\/g, '\\\\')   // 反斜杠先转义
+    .replace(/`/g, '\\`')     // 反引号
+    .replace(/\$/g, '\\$');   // $（防止 ${} 插值）
+
+  return `...
+  <script type="text/babel">
+    ${safe}
+  </script>`;
+}
+
+// ✅ 方案2：用 JSON.stringify 序列化，再 eval（更安全）
+function buildIframeSrc(code: string): string {
+  const serialized = JSON.stringify(code); // 自动处理所有特殊字符
+
+  return `...
+  <script>
+    // 通过 JSON 序列化避免注入
+    const code = ${serialized};
+    Babel.transform(code, { presets: ['react'] });
+    // 再执行编译结果...
+  </script>`;
+}
+```
+
+## 深入追问
+
+### 如何支持多文件（App.jsx + utils.js）？
+
+```text
+单文件方案（上述实现）：
+  简单，一个 <script type="text/babel"> 搞定
+  适合：组件预览、算法演示
+
+多文件方案：
+  需要虚拟文件系统 + 模块解析
+  ① 用 ESM Service Worker 拦截 import 请求
+  ② 或使用 import maps 将 import 重定向到虚拟模块
+  ③ 或直接用 Sandpack（CodeSandbox 的开源方案）
+
+Sandpack 架构：
+  - 基于 Service Worker 实现虚拟文件系统
+  - 在 iframe 内实现完整的 bundler（Parcel）
+  - 支持任意文件结构、npm 依赖
+```
+
+### 生产级 Playground 的优化方向
+
+```text
+1. 编辑器升级
+   textarea → Monaco Editor（VS Code 同款，有语法高亮、自动补全）
+   但 Monaco 体积 ~2MB，需要 Web Worker 加载
+
+2. CDN 资源预加载
+   在页面初始化时预加载 Babel + React CDN 资源
+   <link rel="preload" href="https://unpkg.com/@babel/standalone/...">
+
+3. 编译移至 Web Worker
+   将 Babel.transform 放到 Worker 线程
+   避免大型代码编译时阻塞主线程 UI
+
+4. TypeScript 支持
+   @babel/standalone 支持 data-presets="typescript,react"
+   或使用 @typescript/vfs + TypeScript compiler API
+
+5. 错误提示增强
+   解析 Babel 编译错误的 loc（行列号）
+   在编辑器对应位置显示红色波浪线
+```
+
+### CodeSandbox / StackBlitz 的底层方案对比
+
+```text
+本文方案（轻量）：
+  iframe srcdoc + CDN Babel
+  适合：简单组件预览、教学演示
+  限制：单文件、无 npm 依赖
+
+CodeSandbox Sandpack：
+  Service Worker 虚拟文件系统 + 内置 bundler
+  适合：完整项目预览，支持 npm 包
+  原理：worker 内运行 Parcel bundler
+
+StackBlitz WebContainers：
+  WebAssembly 版 Node.js 运行在浏览器中
+  适合：完整 Node.js 项目，可运行 vite dev server
+  原理：WASM + SharedArrayBuffer + Service Worker
+  限制：需要 COOP/COEP 响应头（跨域隔离）
+```

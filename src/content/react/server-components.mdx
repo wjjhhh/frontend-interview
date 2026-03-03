@@ -1,0 +1,175 @@
+---
+title: "React Server Components 原理与实践"
+description: "RSC 工作原理、与 SSR 的区别、数据获取模式、Next.js App Router 实战"
+difficulty: "高级"
+tags: ["RSC", "Server Components", "App Router", "流式渲染", "Next.js"]
+category: "react"
+order: 3
+---
+
+## 核心概念
+
+React Server Components（RSC）是 React 19 / Next.js App Router 的核心特性，允许组件**在服务器上运行**，直接访问数据库、文件系统，且其代码**不会发送到客户端**。
+
+### RSC vs SSR 的区别
+
+| 维度 | SSR | RSC |
+|------|-----|-----|
+| 执行位置 | 服务器（每次请求） | 服务器（可缓存） |
+| 输出 | HTML 字符串 | RSC Payload（特殊格式） |
+| 水合（Hydration） | 需要全量水合 | 只水合 Client Components |
+| 客户端 JS | 组件代码打包到客户端 | Server Component 代码**不发送**到客户端 |
+| 状态/交互 | 支持（水合后） | 不支持（无 useState/useEffect） |
+
+### RSC 协议格式
+
+Server Component 渲染结果是一种特殊的**流式 JSON**（非 HTML）：
+
+```text
+1:{"name":"App","props":{}}
+2:["$","div",null,{"children":["$","h1",null,{"children":"Hello"}]}]
+3:["$","$L4",null,{"initialData":[1,2,3]}]   ← Client Component 引用
+4:["$","p",null,{"children":"$5"}]
+5:"从数据库查到的内容"
+```
+
+## 高频面试题
+
+### 1. Server Component 和 Client Component 的边界
+
+```tsx
+// app/page.tsx → 默认是 Server Component
+import { db } from '@/lib/db';
+import { LikeButton } from './like-button'; // Client Component
+
+export default async function Page() {
+  // ✅ 可以直接 await，无需 useEffect
+  const posts = await db.query('SELECT * FROM posts');
+
+  return (
+    <ul>
+      {posts.map((post) => (
+        <li key={post.id}>
+          {post.title}
+          {/* 将数据作为 props 传给 Client Component */}
+          <LikeButton postId={post.id} initialLikes={post.likes} />
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+```tsx
+// app/like-button.tsx → 必须标注 "use client"
+'use client';
+import { useState } from 'react';
+
+export function LikeButton({ postId, initialLikes }) {
+  const [likes, setLikes] = useState(initialLikes);
+  return (
+    <button onClick={() => setLikes((l) => l + 1)}>
+      ❤️ {likes}
+    </button>
+  );
+}
+```
+
+### 2. 数据获取模式
+
+```tsx
+// ✅ 并行获取（推荐）
+async function Page({ params }) {
+  // Promise.all 并行发请求
+  const [user, posts] = await Promise.all([
+    fetchUser(params.id),
+    fetchPosts(params.id),
+  ]);
+  return <Profile user={user} posts={posts} />;
+}
+
+// ✅ 流式渲染：让慢的部分不阻塞快的部分
+export default function Page() {
+  return (
+    <>
+      <FastContent />           {/* 立即渲染 */}
+      <Suspense fallback={<Skeleton />}>
+        <SlowContent />         {/* 数据就绪后流式插入 */}
+      </Suspense>
+    </>
+  );
+}
+```
+
+### 3. Server Actions
+
+```tsx
+// app/actions.ts
+'use server';
+
+export async function createPost(formData: FormData) {
+  const title = formData.get('title') as string;
+  // 直接操作数据库，代码不暴露给客户端
+  await db.insert('posts', { title, createdAt: new Date() });
+  revalidatePath('/posts'); // 使缓存失效
+}
+
+// app/new-post.tsx（Client Component）
+'use client';
+import { createPost } from './actions';
+
+export function NewPostForm() {
+  return (
+    <form action={createPost}>
+      <input name="title" />
+      <button type="submit">发布</button>
+    </form>
+  );
+}
+```
+
+### 4. Next.js App Router 缓存层
+
+```tsx
+// fetch 缓存控制
+// 默认缓存（等同于 SSG）
+const data = await fetch('https://api.example.com/data');
+
+// 不缓存（等同于 SSR，每次请求重新获取）
+const data = await fetch('https://api.example.com/data', {
+  cache: 'no-store',
+});
+
+// 定时重新验证（等同于 ISR）
+const data = await fetch('https://api.example.com/data', {
+  next: { revalidate: 3600 }, // 1小时
+});
+
+// 标签化缓存，按需失效
+const data = await fetch('https://api.example.com/posts', {
+  next: { tags: ['posts'] },
+});
+// 某处触发失效
+revalidateTag('posts');
+```
+
+## 深入追问
+
+### RSC 如何实现"零客户端 JS"？
+
+Server Components 的渲染在服务器完成，输出的 RSC Payload 中**只包含**：
+1. 渲染结果（类似虚拟 DOM 的 JSON 描述）
+2. Client Component 的**引用**（模块路径），不含源码
+
+客户端收到 RSC Payload 后，只下载和水合其中引用的 Client Components，Server Components 代码从不下载。
+
+### 什么时候用 Server Component，什么时候用 Client Component？
+
+| 需求 | 选择 |
+|------|------|
+| 访问数据库/文件系统 | Server Component |
+| 使用 useState/useEffect | Client Component |
+| 使用浏览器 API | Client Component |
+| 添加事件监听器 | Client Component |
+| 无需交互的展示内容 | Server Component（减少 JS 体积） |
+| 共享敏感信息（API密钥） | Server Component（不泄露到客户端） |

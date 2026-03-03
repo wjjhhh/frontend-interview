@@ -1,0 +1,275 @@
+---
+title: "Next.js 四层缓存体系"
+description: "Request Memoization、Data Cache、Full Route Cache、Router Cache 原理与控制方式"
+difficulty: "高级"
+tags: ["缓存", "Data Cache", "Router Cache", "revalidate", "unstable_cache"]
+category: "nextjs"
+order: 2
+---
+
+## 四层缓存全景图
+
+Next.js 有四层相互独立的缓存，理解它们是面试高频难点：
+
+```text
+请求链路：用户浏览器 → Next.js 服务器 → 数据源（DB/API）
+
+┌─────────────────────────────────────────────────────────────────┐
+│ Layer 4: Router Cache（客户端内存）                              │
+│  ← 缓存已访问页面的 RSC Payload，前进/后退/prefetch 不重新请求   │
+│  作用域：浏览器 session，导航时命中                               │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ miss → 请求服务器
+┌──────────────────────────▼──────────────────────────────────────┐
+│ Layer 3: Full Route Cache（服务端文件系统）                      │
+│  ← 缓存静态路由完整渲染的 HTML + RSC Payload                     │
+│  作用域：构建时生成，revalidate 后更新                            │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ miss → 执行服务端渲染
+┌──────────────────────────▼──────────────────────────────────────┐
+│ Layer 2: Data Cache（服务端持久化）                              │
+│  ← 缓存 fetch() 请求结果，跨请求复用                             │
+│  控制：fetch cache/next 选项，revalidate/tags                    │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ miss → 请求数据源
+┌──────────────────────────▼──────────────────────────────────────┐
+│ Layer 1: Request Memoization（单次请求内存）                     │
+│  ← 同一渲染树内相同 fetch 只执行一次                              │
+│  作用域：单次服务端请求，渲染完毕自动清空                          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 高频面试题
+
+### 1. Request Memoization（请求记忆化）
+
+**同一服务端请求周期内**，相同 URL 和选项的 `fetch` 自动去重：
+
+```tsx
+// 问题场景：多个组件都需要同一份数据
+// UserProfile 和 UserAvatar 都在同一页面，都要获取当前用户
+
+async function getUser(id: string) {
+  // ✅ React 自动去重：同一渲染树内，相同 URL 只发一次请求
+  const res = await fetch(`https://api.example.com/users/${id}`);
+  return res.json();
+}
+
+// Layout、Page、多个子组件各自调用 getUser(id)
+// 实际只有一次网络请求！不需要用 Context 或 prop drilling 传递数据
+
+async function UserProfile({ id }: { id: string }) {
+  const user = await getUser(id);  // 第一次：发起请求
+  return <div>{user.name}</div>;
+}
+
+async function UserAvatar({ id }: { id: string }) {
+  const user = await getUser(id);  // 命中 Memoization：复用结果
+  return <img src={user.avatar} />;
+}
+```
+
+**注意：** Request Memoization 只在单次服务端渲染内有效，不跨请求持久化。
+
+### 2. Data Cache：控制 fetch 缓存行为
+
+```tsx
+// ① 默认（Next.js 14 默认 force-cache，Next.js 15 默认 no-store）
+const data = await fetch('https://api.example.com/products');
+
+// ② 不缓存，每次请求都重新获取（等同于 SSR）
+const data = await fetch('https://api.example.com/products', {
+  cache: 'no-store',
+});
+
+// ③ 时间驱动重新验证（ISR）：缓存 60 秒后后台重新获取
+const data = await fetch('https://api.example.com/products', {
+  next: { revalidate: 60 },
+});
+
+// ④ 按需重新验证（tag-based），配合 revalidateTag 使用
+const data = await fetch('https://api.example.com/products', {
+  next: { tags: ['products'] },
+});
+
+// 触发重新验证（在 Server Action 或 Route Handler 中）
+import { revalidateTag, revalidatePath } from 'next/cache';
+
+export async function updateProduct(id: string, data: ProductData) {
+  await db.products.update({ where: { id }, data });
+  revalidateTag('products');  // 使所有标记了 products 的 cache 失效
+  // 或者
+  revalidatePath('/products'); // 使特定路径的缓存失效
+}
+```
+
+### 3. unstable_cache：缓存非 fetch 数据源
+
+`fetch` 默认集成了 Data Cache，但数据库查询、ORM、第三方 SDK 不走 `fetch`，需要用 `unstable_cache`：
+
+```tsx
+import { unstable_cache } from 'next/cache';
+
+// 将 DB 查询结果缓存（等同于给 fetch 加 next.tags/revalidate）
+const getCachedProducts = unstable_cache(
+  async (category: string) => {
+    // 原始查询（Prisma / Drizzle / 任意 DB 调用）
+    return db.products.findMany({
+      where: { category },
+      orderBy: { createdAt: 'desc' },
+    });
+  },
+  ['products'],           // 缓存 key（数组，自动包含函数参数）
+  {
+    tags: ['products'],   // 用于 revalidateTag 按需清除
+    revalidate: 3600,     // 1小时后过期
+  }
+);
+
+// 在 Server Component 中使用
+export default async function ProductsPage({ category }: { category: string }) {
+  const products = await getCachedProducts(category);
+  return <ProductList products={products} />;
+}
+```
+
+### 4. Full Route Cache：静态 vs 动态路由
+
+Next.js 构建时自动决定路由是静态还是动态渲染：
+
+```text
+静态路由（构建时渲染，进入 Full Route Cache）：
+  ✓ 不使用动态函数（cookies、headers、searchParams）
+  ✓ 所有 fetch 都有 revalidate 或使用 force-cache
+  → 构建产物：HTML + RSC Payload 文件
+
+动态路由（每次请求渲染，跳过 Full Route Cache）：
+  ✗ 调用了 cookies() / headers()
+  ✗ 使用了 searchParams prop
+  ✗ 任意 fetch 设置了 cache: 'no-store'
+  → 构建产物：无，每次服务端实时渲染
+```
+
+```tsx
+// 强制指定渲染模式（覆盖自动推断）
+export const dynamic = 'force-static';   // 强制静态
+export const dynamic = 'force-dynamic';  // 强制动态
+export const dynamic = 'error';          // 静态，如有动态行为则报错
+
+// 强制指定 revalidate 间隔（整个路由）
+export const revalidate = 3600; // 1小时
+
+// 为动态参数预生成静态页面
+export async function generateStaticParams() {
+  const products = await db.products.findMany({ select: { slug: true } });
+  return products.map(({ slug }) => ({ slug }));
+}
+// 构建时预渲染这些 slug 对应的页面
+// 未列出的 slug 在首次访问时动态生成（dynamicParams = true，默认）
+export const dynamicParams = false; // 设为 false 则未列出的返回 404
+```
+
+### 5. Router Cache（客户端缓存）
+
+Router Cache 在浏览器内存中缓存已访问页面的 RSC Payload，实现快速导航：
+
+```text
+行为：
+  - 前进/后退导航：命中缓存，不发请求
+  - 软导航（<Link> 组件）：命中缓存（30秒内）
+  - Prefetch：鼠标悬停 <Link> 时预取并缓存
+  - 硬刷新（Ctrl+R）：清空缓存
+
+生命周期（Next.js 14+）：
+  - 静态路由缓存：5 分钟
+  - 动态路由缓存：30 秒
+```
+
+```tsx
+// 手动使缓存失效
+import { useRouter } from 'next/navigation';
+
+function SubmitButton() {
+  const router = useRouter();
+
+  async function handleSubmit() {
+    await submitForm();
+    router.refresh(); // 重新从服务器获取当前路由，清除 Router Cache
+  }
+}
+
+// Server Action 中使用 revalidatePath 也会清除 Router Cache
+async function deletePost(id: string) {
+  'use server';
+  await db.posts.delete({ where: { id } });
+  revalidatePath('/posts'); // 同时清除 Data Cache 和 Router Cache
+}
+```
+
+### 6. 缓存失效策略汇总
+
+```tsx
+// 方式1：时间驱动（ISR）
+// 适合：商品列表、博客文章等定期更新的内容
+export const revalidate = 60; // 路由级别
+
+fetch(url, { next: { revalidate: 60 } }); // 请求级别
+
+// 方式2：按需失效（On-demand Revalidation）
+// 适合：CMS 内容更新、用户提交后立即刷新
+import { revalidateTag, revalidatePath } from 'next/cache';
+
+// Webhook 触发（CMS 内容更新时调用）
+export async function POST(req: NextRequest) {
+  const { type, slug } = await req.json();
+
+  if (type === 'post.updated') {
+    revalidateTag('posts');           // 清除所有 posts tag 的缓存
+    revalidatePath(`/blog/${slug}`);  // 清除特定路径
+  }
+
+  return NextResponse.json({ revalidated: true });
+}
+
+// 方式3：Server Action 提交后自动失效
+async function createPost(formData: FormData) {
+  'use server';
+  const post = await db.posts.create({ data: parseFormData(formData) });
+  revalidateTag('posts');
+  redirect(`/blog/${post.slug}`);
+}
+```
+
+## 深入追问
+
+### Next.js 14 vs 15 缓存默认行为变化
+
+```text
+Next.js 14                          Next.js 15
+──────────────────────────          ──────────────────────────
+fetch 默认 force-cache（缓存）  →   fetch 默认 no-store（不缓存）
+GET Route Handler 默认缓存      →   GET Route Handler 默认不缓存
+客户端 Router Cache 30秒/5分   →   Router Cache 默认持续时间减少
+```
+
+```tsx
+// 如果从 14 升级到 15，原来"自动缓存"的请求需要手动加上：
+const data = await fetch(url, {
+  next: { revalidate: 3600 }  // 显式声明缓存策略
+});
+```
+
+### 如何调试缓存命中？
+
+```bash
+# 开发环境：查看 fetch 缓存状态
+# .next/cache/fetch-cache 目录存储 Data Cache
+
+# 生产 build 后查看路由类型
+npm run build
+
+# 输出中的符号含义：
+# ○  Static   - 静态，进入 Full Route Cache
+# λ  Dynamic  - 动态，每次服务端渲染
+# ◐  ISR      - 增量静态再生，有 revalidate
+```

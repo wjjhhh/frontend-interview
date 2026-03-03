@@ -1,0 +1,571 @@
+---
+title: "Electron 桌面应用开发深度解析"
+description: "主进程/渲染进程架构、IPC 通信、contextBridge 安全模型、原生 API、打包发布、与 React 集成"
+difficulty: "高级"
+tags: ["Electron", "主进程", "渲染进程", "IPC", "contextBridge", "electron-builder", "桌面应用"]
+category: "engineering"
+order: 7
+---
+
+## Electron 架构：三层模型
+
+```text
+Electron = Chromium（渲染引擎）+ Node.js（系统能力）+ 胶水层（IPC）
+
+┌─────────────────────────────────────────────────────────────┐
+│  主进程（Main Process）—— Node.js 环境                        │
+│  • 整个应用只有一个                                           │
+│  • 管理所有窗口（BrowserWindow）                              │
+│  • 访问 Node.js 全部能力（fs、path、child_process）           │
+│  • 调用原生 OS API（菜单、托盘、通知、对话框）                  │
+│  • 入口：main.js / main.ts                                   │
+└──────────────┬───────────────────────────────────────────────┘
+               │  IPC（进程间通信）
+               │  ipcMain / ipcRenderer
+               │  contextBridge（安全桥接）
+┌──────────────▼───────────────────────────────────────────────┐
+│  渲染进程（Renderer Process）—— Chromium 环境                  │
+│  • 每个 BrowserWindow 对应一个（可多个）                        │
+│  • 本质是一个受限浏览器，运行 HTML/CSS/JS                       │
+│  • 默认无法访问 Node.js（contextIsolation 开启时）              │
+│  • 通过 preload 脚本暴露受限的 API                             │
+│  • 就是普通的 React / Vue / 原生 JS 前端代码                   │
+└─────────────────────────────────────────────────────────────┘
+               │
+┌──────────────▼───────────────────────────────────────────────┐
+│  Preload 脚本 —— Node.js + 浏览器的桥梁                        │
+│  • 在渲染进程加载前执行，同时能访问 Node.js 和 DOM              │
+│  • 通过 contextBridge 安全地暴露 API 给渲染进程                 │
+│  • 是安全模型的核心                                            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 高频面试题
+
+### 1. 主进程基本结构
+
+```typescript
+// main.ts（主进程入口）
+import { app, BrowserWindow, ipcMain } from 'electron';
+import path from 'path';
+
+let mainWindow: BrowserWindow | null = null;
+
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1200,
+    height: 800,
+    webPreferences: {
+      // ✅ 安全配置（必须）
+      contextIsolation: true,     // 隔离主进程和渲染进程的 JS 上下文
+      nodeIntegration: false,     // 渲染进程不能直接用 Node.js（危险！）
+      sandbox: true,              // 额外的沙箱隔离
+      preload: path.join(__dirname, 'preload.js'), // 预加载脚本路径
+    },
+  });
+
+  // 开发环境加载本地 dev server，生产环境加载打包文件
+  if (process.env.NODE_ENV === 'development') {
+    mainWindow.loadURL('http://localhost:5173');
+    mainWindow.webContents.openDevTools(); // 打开 DevTools
+  } else {
+    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
+  }
+
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+  });
+}
+
+// app 生命周期
+app.whenReady().then(() => {
+  createWindow();
+
+  // macOS：点击 Dock 图标时重新创建窗口
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+});
+
+// 所有窗口关闭时退出（Windows/Linux）
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') app.quit();
+});
+```
+
+### 2. IPC 通信：渲染进程 ↔ 主进程
+
+IPC（Inter-Process Communication）是 Electron 的核心通信机制：
+
+```text
+通信模式：
+
+  渲染进程                              主进程
+  ─────────────────────                ─────────────────────
+  ipcRenderer.send()      →            ipcMain.on()           单向（渲染→主）
+  ipcRenderer.invoke()    →            ipcMain.handle()       双向（渲染→主→渲染，返回值）
+                          ←            webContents.send()     单向（主→渲染）
+  ipcRenderer.on()        ←                                   接收主进程推送
+```
+
+```typescript
+// ── preload.ts（预加载脚本，桥梁）────────────────────────────
+import { contextBridge, ipcRenderer } from 'electron';
+
+// contextBridge：安全地将 API 暴露给渲染进程
+// 渲染进程通过 window.electronAPI 访问
+contextBridge.exposeInMainWorld('electronAPI', {
+  // 读取文件（渲染进程调用，主进程执行）
+  readFile: (filePath: string) =>
+    ipcRenderer.invoke('fs:read-file', filePath),
+
+  // 保存文件
+  saveFile: (filePath: string, content: string) =>
+    ipcRenderer.invoke('fs:save-file', { filePath, content }),
+
+  // 打开文件选择对话框
+  openFileDialog: () =>
+    ipcRenderer.invoke('dialog:open-file'),
+
+  // 监听主进程推送的消息
+  onUpdateAvailable: (callback: (version: string) => void) => {
+    ipcRenderer.on('update:available', (_, version) => callback(version));
+    // 返回清理函数（防止内存泄漏）
+    return () => ipcRenderer.removeAllListeners('update:available');
+  },
+});
+
+// ── main.ts（主进程处理 IPC）────────────────────────────────
+import { ipcMain, dialog, BrowserWindow } from 'electron';
+import fs from 'fs/promises';
+
+// 处理文件读取请求
+ipcMain.handle('fs:read-file', async (event, filePath: string) => {
+  try {
+    const content = await fs.readFile(filePath, 'utf-8');
+    return { success: true, content };
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+});
+
+// 处理文件保存请求
+ipcMain.handle('fs:save-file', async (event, { filePath, content }) => {
+  await fs.writeFile(filePath, content, 'utf-8');
+  return { success: true };
+});
+
+// 处理文件选择对话框
+ipcMain.handle('dialog:open-file', async (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const result = await dialog.showOpenDialog(win!, {
+    properties: ['openFile'],
+    filters: [{ name: 'Text Files', extensions: ['txt', 'md', 'json'] }],
+  });
+  return result.canceled ? null : result.filePaths[0];
+});
+
+// ── renderer（React 组件中使用）─────────────────────────────
+// TypeScript 类型声明
+declare global {
+  interface Window {
+    electronAPI: {
+      readFile: (path: string) => Promise<{ success: boolean; content?: string; error?: string }>;
+      saveFile: (path: string, content: string) => Promise<{ success: boolean }>;
+      openFileDialog: () => Promise<string | null>;
+      onUpdateAvailable: (cb: (version: string) => void) => () => void;
+    };
+  }
+}
+
+// React 组件
+function FileEditor() {
+  const [content, setContent] = useState('');
+  const [filePath, setFilePath] = useState<string | null>(null);
+
+  async function handleOpen() {
+    const path = await window.electronAPI.openFileDialog();
+    if (!path) return;
+    const result = await window.electronAPI.readFile(path);
+    if (result.success) {
+      setFilePath(path);
+      setContent(result.content!);
+    }
+  }
+
+  async function handleSave() {
+    if (!filePath) return;
+    await window.electronAPI.saveFile(filePath, content);
+  }
+
+  return (
+    <div>
+      <button onClick={handleOpen}>打开文件</button>
+      <button onClick={handleSave}>保存</button>
+      <textarea value={content} onChange={(e) => setContent(e.target.value)} />
+    </div>
+  );
+}
+```
+
+### 3. 安全模型：contextIsolation 的重要性
+
+```typescript
+// ❌ 危险配置（旧版 Electron 常见错误）
+new BrowserWindow({
+  webPreferences: {
+    nodeIntegration: true,    // 渲染进程可直接用 Node.js
+    contextIsolation: false,  // 主进程和渲染进程共享 JS 上下文
+  }
+})
+
+// 危险性：
+// 1. 如果渲染进程加载了恶意第三方脚本
+//    → 脚本可以访问 Node.js 的 require、fs、child_process
+//    → 可以读写文件系统、执行系统命令！
+
+// ❌ 渲染进程可以直接执行：
+const { exec } = require('child_process');
+exec('rm -rf ~');  // 删除用户目录！
+
+// ✅ 安全配置 + contextBridge
+// contextIsolation: true → 渲染进程有独立的 JS 上下文
+// 即使 nodeIntegration: false，preload 脚本也能访问 Node.js
+// 但 contextBridge 只暴露你显式允许的 API
+```
+
+```text
+攻击场景：XSS + nodeIntegration
+  用户访问了一个恶意网站的链接
+    → 应用加载了恶意内容
+    → 恶意脚本执行 require('child_process').exec('...')
+    → 系统被入侵
+
+防御层：
+  ① nodeIntegration: false（最重要）
+  ② contextIsolation: true（隔离上下文）
+  ③ sandbox: true（操作系统级沙箱）
+  ④ CSP（Content Security Policy）限制脚本来源
+  ⑤ preload 中只暴露必要 API，不暴露原始 ipcRenderer
+```
+
+### 4. 原生 OS 能力
+
+```typescript
+import {
+  dialog, Menu, Tray, Notification,
+  shell, clipboard, globalShortcut, nativeTheme,
+} from 'electron';
+
+// ① 系统菜单（应用菜单栏）
+const menuTemplate: Electron.MenuItemConstructorOptions[] = [
+  {
+    label: '文件',
+    submenu: [
+      { label: '新建', accelerator: 'CmdOrCtrl+N', click: () => createNewFile() },
+      { label: '打开', accelerator: 'CmdOrCtrl+O', click: () => openFile() },
+      { type: 'separator' },
+      { label: '退出', role: 'quit' },
+    ],
+  },
+  { label: '编辑', role: 'editMenu' },  // 内置角色（自动填充剪切/复制/粘贴）
+  { label: '视图', role: 'viewMenu' },
+];
+const menu = Menu.buildFromTemplate(menuTemplate);
+Menu.setApplicationMenu(menu);
+
+// ② 系统托盘
+const tray = new Tray(path.join(__dirname, 'icon.png'));
+tray.setToolTip('我的应用');
+tray.setContextMenu(Menu.buildFromTemplate([
+  { label: '显示窗口', click: () => mainWindow?.show() },
+  { label: '退出', click: () => app.quit() },
+]));
+tray.on('double-click', () => mainWindow?.show());
+
+// ③ 系统通知
+new Notification({
+  title: '下载完成',
+  body: '文件已保存到桌面',
+  icon: path.join(__dirname, 'icon.png'),
+}).show();
+
+// ④ 文件对话框
+const { filePaths } = await dialog.showOpenDialog({
+  title: '选择图片',
+  properties: ['openFile', 'multiSelections'],
+  filters: [{ name: '图片', extensions: ['jpg', 'png', 'gif', 'webp'] }],
+});
+
+const { filePath } = await dialog.showSaveDialog({
+  defaultPath: path.join(app.getPath('downloads'), 'export.csv'),
+  filters: [{ name: 'CSV', extensions: ['csv'] }],
+});
+
+// ⑤ 用系统默认程序打开文件/URL
+shell.openPath('/Users/me/document.pdf');      // 用 Preview 打开 PDF
+shell.openExternal('https://example.com');     // 用默认浏览器打开
+
+// ⑥ 剪贴板
+clipboard.writeText('复制的内容');
+const text = clipboard.readText();
+
+// ⑦ 全局快捷键（应用在后台也生效）
+globalShortcut.register('CmdOrCtrl+Shift+Space', () => {
+  mainWindow?.isVisible() ? mainWindow.hide() : mainWindow?.show();
+});
+app.on('will-quit', () => globalShortcut.unregisterAll());
+
+// ⑧ 深色/浅色模式
+nativeTheme.on('updated', () => {
+  const isDark = nativeTheme.shouldUseDarkColors;
+  mainWindow?.webContents.send('theme:changed', isDark ? 'dark' : 'light');
+});
+```
+
+### 5. 多窗口与 BrowserView
+
+```typescript
+// 创建子窗口（如设置面板）
+function openSettingsWindow() {
+  const settingsWin = new BrowserWindow({
+    parent: mainWindow!,      // 父窗口
+    modal: true,              // 模态窗口（阻塞父窗口交互）
+    width: 600,
+    height: 400,
+    webPreferences: {
+      contextIsolation: true,
+      preload: path.join(__dirname, 'preload.js'),
+    },
+  });
+  settingsWin.loadURL('http://localhost:5173/settings');
+}
+
+// WebContentsView：在窗口内嵌入网页（替代已废弃的 BrowserView）
+import { WebContentsView } from 'electron';
+
+const view = new WebContentsView({
+  webPreferences: { contextIsolation: true },
+});
+mainWindow.contentView.addChildView(view);
+
+// 设置嵌入区域（如：右侧内容区）
+view.setBounds({ x: 200, y: 0, width: 1000, height: 800 });
+view.webContents.loadURL('https://docs.example.com');
+
+// 用途：类浏览器应用（多标签、侧边栏嵌入）
+// 相比 iframe：独立进程，崩溃不影响主窗口；可加载跨域内容
+```
+
+### 6. 打包发布：electron-builder
+
+```bash
+# 安装
+npm install -D electron-builder
+
+# 打包（生成当前平台的安装包）
+npx electron-builder build
+
+# 跨平台打包（需要对应环境或 CI）
+npx electron-builder build --mac --win --linux
+```
+
+```javascript
+// electron-builder.config.js
+module.exports = {
+  appId: 'com.example.myapp',
+  productName: 'My App',
+  copyright: 'Copyright © 2025',
+
+  // 打包的文件
+  files: [
+    'dist/**/*',        // 渲染进程构建产物
+    'dist-electron/**/*', // 主进程构建产物
+  ],
+
+  // macOS 配置
+  mac: {
+    category: 'public.app-category.productivity',
+    icon: 'build/icon.icns',
+    target: [
+      { target: 'dmg', arch: ['x64', 'arm64'] }, // Intel + Apple Silicon
+      { target: 'zip', arch: ['x64', 'arm64'] },
+    ],
+    hardenedRuntime: true,          // 必须，发布到 App Store 要求
+    gatekeeperAssess: false,
+    entitlements: 'build/entitlements.mac.plist',
+  },
+
+  // Windows 配置
+  win: {
+    target: 'nsis',                 // 安装包格式（NSIS installer）
+    icon: 'build/icon.ico',
+    certificateFile: 'cert.p12',    // 代码签名证书（避免 SmartScreen 警告）
+  },
+
+  // Linux 配置
+  linux: {
+    target: ['AppImage', 'deb', 'rpm'],
+    category: 'Utility',
+  },
+
+  // 自动更新
+  publish: {
+    provider: 'github',             // 发布到 GitHub Releases
+    owner: 'your-github-username',
+    repo: 'your-repo',
+  },
+};
+```
+
+**自动更新（autoUpdater）：**
+
+```typescript
+// main.ts
+import { autoUpdater } from 'electron-updater';
+
+app.whenReady().then(() => {
+  createWindow();
+
+  // 检查更新（应用启动后延迟检查）
+  setTimeout(() => {
+    autoUpdater.checkForUpdatesAndNotify();
+  }, 3000);
+});
+
+// 更新事件
+autoUpdater.on('update-available', (info) => {
+  // 通知渲染进程
+  mainWindow?.webContents.send('update:available', info.version);
+});
+
+autoUpdater.on('download-progress', (progress) => {
+  mainWindow?.webContents.send('update:progress', Math.round(progress.percent));
+});
+
+autoUpdater.on('update-downloaded', () => {
+  // 下载完成，提示用户重启
+  mainWindow?.webContents.send('update:downloaded');
+});
+
+// 渲染进程：用户点击"立即更新"
+ipcMain.on('update:install', () => {
+  autoUpdater.quitAndInstall();
+});
+```
+
+### 7. 与 React + Vite 集成
+
+```bash
+# 推荐：electron-vite（专为 Electron 优化的 Vite 工具链）
+npm create @quick-start/electron my-app
+cd my-app && npm install && npm run dev
+```
+
+```typescript
+// electron.vite.config.ts
+import { resolve } from 'path';
+import { defineConfig, externalizeDepsPlugin } from 'electron-vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  main: {
+    plugins: [externalizeDepsPlugin()],  // 主进程：排除 node_modules
+  },
+  preload: {
+    plugins: [externalizeDepsPlugin()],
+  },
+  renderer: {
+    resolve: {
+      alias: { '@renderer': resolve('src/renderer/src') },
+    },
+    plugins: [react()],   // 渲染进程：正常的 Vite React 配置
+  },
+});
+
+// 目录结构（electron-vite 约定）
+// src/
+//   main/           → 主进程代码（Node.js）
+//     index.ts
+//   preload/        → preload 脚本
+//     index.ts
+//   renderer/       → 渲染进程（React App）
+//     src/
+//       App.tsx
+//       main.tsx
+```
+
+## 深入追问
+
+### 主进程性能：为什么不能阻塞主进程？
+
+```typescript
+// ❌ 在主进程执行耗时同步操作（卡死整个应用）
+ipcMain.handle('compress-image', (event, filePath) => {
+  const result = compressImageSync(filePath);  // 同步，阻塞主进程
+  // 期间所有窗口无响应！菜单无法点击！
+  return result;
+});
+
+// ✅ 方案1：async/await（I/O 操作）
+ipcMain.handle('compress-image', async (event, filePath) => {
+  const result = await compressImage(filePath);  // 异步，不阻塞
+  return result;
+});
+
+// ✅ 方案2：Worker Threads（CPU 密集型任务）
+import { Worker } from 'worker_threads';
+
+ipcMain.handle('process-data', (event, data) => {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker('./workers/data-processor.js', {
+      workerData: data,
+    });
+    worker.on('message', resolve);
+    worker.on('error', reject);
+  });
+});
+
+// ✅ 方案3：utility process（隔离的子进程，Electron 特有）
+import { utilityProcess } from 'electron';
+
+const child = utilityProcess.fork('./workers/heavy-task.js');
+child.postMessage({ type: 'start', data });
+child.on('message', (result) => {
+  mainWindow?.webContents.send('task:done', result);
+});
+```
+
+### Electron 应用内存占用为什么高？
+
+```text
+原因：
+  每个 BrowserWindow = 独立 Chromium 渲染进程（约 100MB+）
+  主进程 + Node.js runtime（约 50MB）
+  如果有 3 个窗口 → 约 350MB~ 起步
+
+优化策略：
+  1. 减少窗口数量（复用单窗口 + 路由切换）
+  2. 隐藏窗口而非销毁（win.hide() 而不是 win.close()）
+  3. 按需创建：弹窗在需要时创建，关闭时销毁
+  4. BrowserWindow.addBrowserView 共享渲染进程（嵌入式视图）
+  5. 渲染进程懒加载：路由级代码分割
+  6. 避免内存泄漏：ipcRenderer.on 添加监听记得在组件卸载时移除
+```
+
+### Electron vs Tauri：如何选择？
+
+```text
+Electron                             Tauri（新兴竞争者）
+───────────────────────────          ──────────────────────────────
+打包 Chromium（约 100MB+）           使用系统 WebView（macOS WKWebView / Windows WebView2）
+Node.js 主进程                       Rust 后端
+安装包大                             安装包极小（约 5MB）
+Node.js 生态丰富                     Rust 生态，前端需要学 Rust
+跨平台表现一致（内置 Chromium）       依赖系统 WebView，各平台渲染差异
+社区成熟，VS Code/Slack/Discord 用   新兴，社区增长快
+
+选择建议：
+  Electron → 团队熟悉 JS，需要稳定 Node.js 生态，不在意包体积
+  Tauri    → 追求小体积/低内存，团队有 Rust 能力，性能要求高
+```

@@ -2,6 +2,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ArrowLeft, ChevronLeft, ChevronRight } from "lucide-react";
 import { MDXRemote } from "next-mdx-remote/rsc";
+import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { DifficultyBadge } from "@/components/difficulty-badge";
@@ -87,7 +88,7 @@ export default async function PostPage({ params }: Props) {
           </header>
 
           <div className="prose prose-neutral dark:prose-invert max-w-none">
-            <MDXRemote source={post.content} components={mdxComponents} />
+            <MDXRemote source={post.content} components={mdxComponents} options={{ mdxOptions: { remarkPlugins: [remarkGfm] } }} />
           </div>
 
           <Separator className="my-8" />

@@ -1,0 +1,352 @@
+---
+title: "React 状态管理深度对比"
+description: "useState/useReducer/Context、Zustand、Jotai 原理与选型策略"
+difficulty: "高级"
+tags: ["状态管理", "Zustand", "Jotai", "useReducer", "Context"]
+category: "react"
+order: 5
+---
+
+## 状态分层原则
+
+不是所有状态都需要状态管理库。按作用范围分层：
+
+| 层级 | 工具 | 示例 |
+|------|------|------|
+| 组件内部 | `useState` / `useReducer` | 表单值、modal 开关 |
+| 兄弟组件共享 | 状态提升 + props | 父子通信 |
+| 子树共享 | `Context` | 主题、语言 |
+| 全局（客户端） | Zustand / Jotai | 用户信息、购物车 |
+| 服务器状态 | TanStack Query / SWR | API 数据缓存 |
+
+## 高频面试题
+
+### 1. useReducer vs useState
+
+```tsx
+// useState：适合简单、独立的状态
+const [count, setCount] = useState(0);
+
+// useReducer：适合复杂状态逻辑、多个状态联动
+type State = { count: number; status: 'idle' | 'loading' | 'error' };
+type Action =
+  | { type: 'increment' }
+  | { type: 'decrement' }
+  | { type: 'reset'; payload: number };
+
+function reducer(state: State, action: Action): State {
+  switch (action.type) {
+    case 'increment':
+      return { ...state, count: state.count + 1 };
+    case 'decrement':
+      return { ...state, count: state.count - 1 };
+    case 'reset':
+      return { ...state, count: action.payload };
+    default:
+      return state;
+  }
+}
+
+const [state, dispatch] = useReducer(reducer, { count: 0, status: 'idle' });
+dispatch({ type: 'increment' });
+```
+
+### 2. Zustand 核心原理与使用
+
+Zustand 基于**发布订阅 + 浅比较**，只重渲染实际用到的数据切片：
+
+```tsx
+import { create } from 'zustand';
+import { immer } from 'zustand/middleware/immer';
+
+interface CartStore {
+  items: CartItem[];
+  total: number;
+  addItem: (item: CartItem) => void;
+  removeItem: (id: string) => void;
+}
+
+const useCartStore = create<CartStore>()(
+  immer((set) => ({
+    items: [],
+    total: 0,
+    addItem: (item) =>
+      set((state) => {
+        state.items.push(item);
+        state.total += item.price;
+      }),
+    removeItem: (id) =>
+      set((state) => {
+        const index = state.items.findIndex((i) => i.id === id);
+        if (index !== -1) {
+          state.total -= state.items[index].price;
+          state.items.splice(index, 1);
+        }
+      }),
+  }))
+);
+
+// 组件中按需订阅（只订阅 items，total 变化不触发重渲染）
+function CartList() {
+  const items = useCartStore((state) => state.items);
+  const removeItem = useCartStore((state) => state.removeItem);
+  // ...
+}
+```
+
+**Zustand 简化源码原理：**
+
+```javascript
+function create(createState) {
+  let state;
+  const listeners = new Set();
+
+  const setState = (partial) => {
+    const nextState = typeof partial === 'function' ? partial(state) : partial;
+    if (!Object.is(nextState, state)) {
+      state = Object.assign({}, state, nextState);
+      listeners.forEach((listener) => listener(state));
+    }
+  };
+
+  const getState = () => state;
+
+  const subscribe = (listener) => {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  };
+
+  state = createState(setState, getState);
+
+  // React Hook 部分（简化）
+  function useStore(selector) {
+    return useSyncExternalStore(subscribe, () => selector(getState()));
+  }
+
+  return useStore;
+}
+```
+
+### 3. Jotai：原子化状态
+
+Jotai 的原子（atom）可组合，天然避免过度渲染：
+
+```tsx
+import { atom, useAtom, useAtomValue, useSetAtom } from 'jotai';
+
+// 基础原子
+const countAtom = atom(0);
+
+// 派生原子（类似 computed）
+const doubleCountAtom = atom((get) => get(countAtom) * 2);
+
+// 异步原子
+const userAtom = atom(async (get) => {
+  const id = get(userIdAtom);
+  return fetch(`/api/users/${id}`).then((r) => r.json());
+});
+
+// 写操作原子
+const incrementAtom = atom(null, (get, set, step: number = 1) => {
+  set(countAtom, get(countAtom) + step);
+});
+
+function Counter() {
+  const count = useAtomValue(countAtom);        // 只读
+  const increment = useSetAtom(incrementAtom);  // 只写，不订阅
+  return <button onClick={() => increment()}>{count}</button>;
+}
+```
+
+### 4. TanStack Query：服务器状态管理
+
+```tsx
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+
+// 数据获取（自动缓存、后台刷新、错误重试）
+function UserProfile({ userId }) {
+  const { data: user, isLoading, error } = useQuery({
+    queryKey: ['user', userId],  // 缓存 key
+    queryFn: () => fetchUser(userId),
+    staleTime: 5 * 60 * 1000,  // 5分钟内不重新请求
+    gcTime: 10 * 60 * 1000,    // 10分钟后清除缓存
+  });
+
+  if (isLoading) return <Skeleton />;
+  if (error) return <Error />;
+  return <div>{user.name}</div>;
+}
+
+// 数据变更（自动使缓存失效）
+function EditProfile() {
+  const queryClient = useQueryClient();
+  const mutation = useMutation({
+    mutationFn: updateUser,
+    onSuccess: () => {
+      // 使相关缓存失效，触发重新获取
+      queryClient.invalidateQueries({ queryKey: ['user'] });
+    },
+    // 乐观更新
+    onMutate: async (newData) => {
+      await queryClient.cancelQueries({ queryKey: ['user', newData.id] });
+      const previous = queryClient.getQueryData(['user', newData.id]);
+      queryClient.setQueryData(['user', newData.id], newData);
+      return { previous };
+    },
+    onError: (err, newData, context) => {
+      queryClient.setQueryData(['user', newData.id], context.previous);
+    },
+  });
+}
+```
+
+### 5. Zustand Middleware 原理与组合
+
+Zustand middleware 是**高阶函数**，每层包装 `set`/`get`/`api`，链式组合：
+
+```tsx
+// devtools + persist + immer 三层组合
+const useStore = create<StoreState>()(
+  devtools(
+    persist(
+      immer((set) => ({
+        bears: 0,
+        // immer 允许直接"修改" state，内部转为不可变更新
+        increase: () => set((state) => { state.bears++; }),
+        reset: () => set((state) => { state.bears = 0; }),
+      })),
+      {
+        name: 'bear-storage',
+        // 只持久化部分状态（避免存储敏感/临时数据）
+        partialize: (state) => ({ bears: state.bears }),
+        storage: createJSONStorage(() => sessionStorage), // 自定义存储
+      }
+    ),
+    { name: 'BearStore' } // Redux DevTools 中显示的名称
+  )
+);
+
+// 手写 logger middleware，理解原理
+const logger =
+  <T>(config: StateCreator<T>): StateCreator<T> =>
+  (set, get, api) =>
+    config(
+      (...args) => {
+        console.log('prev state:', get());
+        set(...args);
+        console.log('next state:', get());
+      },
+      get,
+      api
+    );
+```
+
+### 6. Jotai atomFamily：动态原子
+
+```tsx
+import { atom, useAtom, useAtomValue, useSetAtom } from 'jotai';
+import { atomFamily, atomWithStorage, loadable } from 'jotai/utils';
+
+// atomFamily：根据参数动态创建/复用 atom，避免手动维护 Map<id, atom>
+const todoAtomFamily = atomFamily(
+  (id: number) => atom({ id, text: '', done: false }),
+  (a, b) => a === b // 相等性判断，决定是否复用同一个 atom
+);
+
+function TodoItem({ id }: { id: number }) {
+  const [todo, setTodo] = useAtom(todoAtomFamily(id));
+  // 每个 id 对应独立 atom，互不影响
+  return (
+    <label>
+      <input
+        type="checkbox"
+        checked={todo.done}
+        onChange={(e) => setTodo((prev) => ({ ...prev, done: e.target.checked }))}
+      />
+      {todo.text}
+    </label>
+  );
+}
+
+// atomWithStorage：自动同步到 localStorage
+const themeAtom = atomWithStorage<'light' | 'dark'>('theme', 'light');
+
+// loadable：处理异步 atom 的三态（loading/error/data），不触发 Suspense
+const userAtom = atom(async (get) => {
+  const id = get(userIdAtom);
+  return fetchUser(id);
+});
+
+const loadableUserAtom = loadable(userAtom);
+
+function UserInfo() {
+  const state = useAtomValue(loadableUserAtom);
+  if (state.state === 'loading') return <Spinner />;
+  if (state.state === 'hasError') return <p>Error</p>;
+  return <p>{state.data.name}</p>;
+}
+```
+
+### 7. 无限加载（Infinite Loading）
+
+```tsx
+import { useInfiniteQuery } from '@tanstack/react-query';
+import { useInView } from 'react-intersection-observer';
+
+function InfinitePostList() {
+  const {
+    data,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useInfiniteQuery({
+    queryKey: ['posts'],
+    queryFn: ({ pageParam }) =>
+      fetchPosts({ cursor: pageParam, limit: 10 }),
+    initialPageParam: undefined as string | undefined,
+    // 从每页响应中提取下一页的 cursor
+    getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+  });
+
+  // data.pages 是每页结果的数组，需要 flatMap
+  const posts = data?.pages.flatMap((page) => page.items) ?? [];
+
+  // IntersectionObserver：滚动到底部时自动加载
+  const { ref } = useInView({
+    onChange: (inView) => {
+      if (inView && hasNextPage && !isFetchingNextPage) {
+        fetchNextPage();
+      }
+    },
+  });
+
+  return (
+    <div>
+      {posts.map((post) => (
+        <PostCard key={post.id} post={post} />
+      ))}
+      {/* 哨兵元素：进入视口时触发加载 */}
+      <div ref={ref} className="h-4">
+        {isFetchingNextPage && <Spinner />}
+      </div>
+    </div>
+  );
+}
+```
+
+## 深入追问
+
+### 如何选择状态管理方案？
+
+- **只有 UI 状态**（modal、tab）→ `useState`
+- **复杂本地逻辑**（多步骤表单）→ `useReducer`
+- **跨组件共享、低频更新**（主题、语言）→ `Context`
+- **中大型应用全局状态** → `Zustand`（简单）或 `Jotai`（原子化）
+- **服务器数据** → `TanStack Query` 或 `SWR`，**不要**放进 Zustand
+
+### Redux 为什么不再流行？
+
+1. 样板代码过多（action types、reducers、selectors）
+2. RTK（Redux Toolkit）虽然简化了，但仍比 Zustand 复杂
+3. React 生态更倾向于轻量方案
+4. 服务器状态用 TanStack Query 更合适，Redux 的使用场景大幅缩小

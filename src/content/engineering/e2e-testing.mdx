@@ -1,0 +1,425 @@
+---
+title: "E2E 测试实战：Playwright 深度指南"
+description: "Playwright vs Cypress 选型、核心 API、Page Object Model、网络拦截、CI 集成"
+difficulty: "高级"
+tags: ["E2E测试", "Playwright", "Cypress", "Page Object Model", "CI/CD"]
+category: "engineering"
+order: 5
+---
+
+## E2E 测试 vs 单元测试
+
+```text
+                单元测试              E2E 测试
+────────────────────────────────────────────────────────
+测试对象        函数/组件              完整用户流程
+运行环境        jsdom（模拟）          真实浏览器
+速度            毫秒级                秒级（10~30s/用例）
+维护成本        低                    高（UI 变化易碎）
+发现问题        逻辑错误               集成/兼容问题
+典型场景        工具函数、组件行为     登录、下单、核心路径
+
+原则：E2E 只测核心业务路径，细节交给单元测试
+```
+
+## Playwright vs Cypress
+
+```text
+Playwright（微软）                   Cypress
+──────────────────────────           ──────────────────────────
+支持 Chromium / Firefox / WebKit    仅 Chrome/Edge（付费版 Firefox）
+多标签页 / iframe / 弹窗原生支持     多标签页支持有限
+可并行执行（独立 worker）            免费版串行执行
+Node.js 环境直接 await              独特的链式 API
+网络拦截 request.fulfill            cy.intercept
+更接近真实浏览器行为                 内置等待机制，更易上手
+适合：复杂跨页面流程、CI             适合：快速入门、实时调试
+```
+
+> 新项目推荐 **Playwright**，功能更全、维护更活跃。
+
+## 高频面试题
+
+### 1. Playwright 核心概念
+
+```text
+Browser  →  BrowserContext  →  Page
+  │               │               │
+ 浏览器         隔离会话          标签页
+（Chromium）  （独立 cookie）   （DOM/JS）
+
+每个测试用例使用独立的 BrowserContext：
+  - Cookie、localStorage 完全隔离
+  - 避免测试间相互污染
+  - 支持并行执行
+```
+
+```typescript
+// playwright.config.ts
+import { defineConfig, devices } from '@playwright/test';
+
+export default defineConfig({
+  testDir: './e2e',
+  fullyParallel: true,          // 并行执行
+  retries: process.env.CI ? 2 : 0, // CI 上失败重试 2 次
+  workers: process.env.CI ? 1 : undefined,
+  reporter: 'html',             // 生成 HTML 报告
+  use: {
+    baseURL: 'http://localhost:3000',
+    trace: 'on-first-retry',    // 失败时录制 trace
+    screenshot: 'only-on-failure',
+    video: 'retain-on-failure',
+  },
+  projects: [
+    { name: 'chromium', use: { ...devices['Desktop Chrome'] } },
+    { name: 'firefox',  use: { ...devices['Desktop Firefox'] } },
+    { name: 'mobile',   use: { ...devices['iPhone 13'] } },
+  ],
+  // 测试前启动 dev server
+  webServer: {
+    command: 'npm run dev',
+    url: 'http://localhost:3000',
+    reuseExistingServer: !process.env.CI,
+  },
+});
+```
+
+### 2. 核心 API：定位器（Locator）
+
+Playwright 的定位器是**惰性的**（lazy），不会立即查找 DOM：
+
+```typescript
+import { test, expect } from '@playwright/test';
+
+test('用户登录', async ({ page }) => {
+  await page.goto('/login');
+
+  // ✅ 推荐：语义化定位器（可访问性角色）
+  await page.getByRole('textbox', { name: '邮箱' }).fill('user@example.com');
+  await page.getByRole('textbox', { name: '密码' }).fill('password123');
+  await page.getByRole('button', { name: '登录' }).click();
+
+  // ✅ 文本内容定位
+  await page.getByText('欢迎回来').waitFor();
+
+  // ✅ 标签定位
+  await page.getByLabel('记住我').check();
+
+  // ✅ placeholder 定位
+  await page.getByPlaceholder('请输入搜索词').fill('React');
+
+  // ✅ 测试 ID（最后手段）
+  await page.getByTestId('submit-btn').click();
+
+  // ⚠️ 避免：CSS 选择器（脆弱，UI 改动易失效）
+  // await page.locator('.btn-primary.submit').click(); ❌
+  // await page.locator('#root > div > form > button').click(); ❌
+});
+```
+
+### 3. 断言：自动等待机制
+
+Playwright 的断言自动重试（默认 5 秒），无需手写 `waitFor`：
+
+```typescript
+// ✅ 自动等待：失败时自动重试直到超时
+await expect(page.getByText('登录成功')).toBeVisible();
+await expect(page.getByRole('button', { name: '提交' })).toBeEnabled();
+await expect(page.getByTestId('count')).toHaveText('42');
+await expect(page.getByTestId('input')).toHaveValue('hello');
+await expect(page.locator('form')).toHaveCount(1);
+
+// URL 断言
+await expect(page).toHaveURL('/dashboard');
+await expect(page).toHaveURL(/\/user\/\d+/);
+
+// 页面 title
+await expect(page).toHaveTitle('前端面试宝典');
+
+// 不可见（等待消失）
+await expect(page.getByText('加载中...')).not.toBeVisible();
+
+// ❌ 不要手写 sleep
+// await page.waitForTimeout(2000); // 不稳定、浪费时间
+```
+
+### 4. Page Object Model（POM）
+
+将页面操作封装成类，避免测试代码重复：
+
+```typescript
+// e2e/pages/LoginPage.ts
+import { type Page, type Locator, expect } from '@playwright/test';
+
+export class LoginPage {
+  readonly page: Page;
+  readonly emailInput: Locator;
+  readonly passwordInput: Locator;
+  readonly submitButton: Locator;
+  readonly errorMessage: Locator;
+
+  constructor(page: Page) {
+    this.page = page;
+    this.emailInput = page.getByRole('textbox', { name: '邮箱' });
+    this.passwordInput = page.getByRole('textbox', { name: '密码' });
+    this.submitButton = page.getByRole('button', { name: '登录' });
+    this.errorMessage = page.getByRole('alert');
+  }
+
+  async goto() {
+    await this.page.goto('/login');
+  }
+
+  async login(email: string, password: string) {
+    await this.emailInput.fill(email);
+    await this.passwordInput.fill(password);
+    await this.submitButton.click();
+  }
+
+  async expectLoginSuccess() {
+    await expect(this.page).toHaveURL('/dashboard');
+  }
+
+  async expectError(message: string) {
+    await expect(this.errorMessage).toContainText(message);
+  }
+}
+
+// e2e/pages/DashboardPage.ts
+export class DashboardPage {
+  constructor(private page: Page) {}
+
+  async goto() { await this.page.goto('/dashboard'); }
+  async getWelcomeText() { return this.page.getByRole('heading').textContent(); }
+  async logout() { await this.page.getByRole('button', { name: '退出' }).click(); }
+}
+
+// e2e/auth.spec.ts（测试代码干净、可读）
+import { test, expect } from '@playwright/test';
+import { LoginPage } from './pages/LoginPage';
+import { DashboardPage } from './pages/DashboardPage';
+
+test.describe('用户认证', () => {
+  test('正确凭据登录成功', async ({ page }) => {
+    const loginPage = new LoginPage(page);
+    await loginPage.goto();
+    await loginPage.login('user@example.com', 'password123');
+    await loginPage.expectLoginSuccess();
+  });
+
+  test('错误密码显示错误提示', async ({ page }) => {
+    const loginPage = new LoginPage(page);
+    await loginPage.goto();
+    await loginPage.login('user@example.com', 'wrongpassword');
+    await loginPage.expectError('密码错误');
+  });
+
+  test('登录后可以退出', async ({ page }) => {
+    const loginPage = new LoginPage(page);
+    const dashboardPage = new DashboardPage(page);
+
+    await loginPage.goto();
+    await loginPage.login('user@example.com', 'password123');
+    await dashboardPage.logout();
+    await expect(page).toHaveURL('/login');
+  });
+});
+```
+
+### 5. 网络拦截与 Mock
+
+```typescript
+test('API 失败时显示错误页', async ({ page }) => {
+  // 拦截并返回模拟响应
+  await page.route('**/api/users', (route) => {
+    route.fulfill({
+      status: 500,
+      contentType: 'application/json',
+      body: JSON.stringify({ error: 'Internal Server Error' }),
+    });
+  });
+
+  await page.goto('/users');
+  await expect(page.getByText('加载失败，请重试')).toBeVisible();
+});
+
+test('慢网络下显示加载状态', async ({ page }) => {
+  await page.route('**/api/products', async (route) => {
+    await new Promise(r => setTimeout(r, 2000)); // 模拟慢请求
+    await route.continue();                       // 继续原始请求
+  });
+
+  await page.goto('/products');
+  await expect(page.getByText('加载中...')).toBeVisible();
+  await expect(page.getByText('加载中...')).not.toBeVisible({ timeout: 5000 });
+});
+
+// 修改响应（代理模式）
+await page.route('**/api/user/profile', async (route) => {
+  const response = await route.fetch();          // 先发真实请求
+  const json = await response.json();
+  json.vip = true;                               // 修改响应数据
+  await route.fulfill({ response, json });
+});
+
+// 监听请求（断言被调用）
+const [request] = await Promise.all([
+  page.waitForRequest('**/api/cart/add'),        // 等待请求发出
+  page.getByRole('button', { name: '加入购物车' }).click(),
+]);
+expect(request.method()).toBe('POST');
+expect(await request.postDataJSON()).toMatchObject({ productId: '123' });
+```
+
+### 6. 认证状态复用（storageState）
+
+每个测试都走登录流程很慢，用 `storageState` 保存并复用 cookie：
+
+```typescript
+// e2e/auth.setup.ts（全局 setup，只执行一次）
+import { test as setup } from '@playwright/test';
+import path from 'path';
+
+const authFile = path.join(__dirname, '.auth/user.json');
+
+setup('authenticate', async ({ page }) => {
+  await page.goto('/login');
+  await page.getByLabel('邮箱').fill('user@example.com');
+  await page.getByLabel('密码').fill('password123');
+  await page.getByRole('button', { name: '登录' }).click();
+  await page.waitForURL('/dashboard');
+
+  // 保存 cookie + localStorage 到文件
+  await page.context().storageState({ path: authFile });
+});
+
+// playwright.config.ts
+export default defineConfig({
+  projects: [
+    { name: 'setup', testMatch: /auth.setup.ts/ },  // 先执行 setup
+    {
+      name: 'authenticated',
+      use: { storageState: '.auth/user.json' },      // 复用登录状态
+      dependencies: ['setup'],                        // 等 setup 完成
+    },
+  ],
+});
+
+// 需要登录的测试自动已登录，无需每次走登录流程
+test('访问 dashboard', async ({ page }) => {
+  await page.goto('/dashboard');  // 直接进，不需要登录
+  await expect(page.getByText('欢迎回来')).toBeVisible();
+});
+```
+
+### 7. 调试技巧
+
+```bash
+# 1. 有头模式（可看到浏览器）
+npx playwright test --headed
+
+# 2. UI 模式（可视化测试运行器，最好用）
+npx playwright test --ui
+
+# 3. 调试模式（逐步执行，可设断点）
+npx playwright test --debug
+
+# 4. 查看 trace（失败时的操作录像）
+npx playwright show-trace test-results/xxx/trace.zip
+
+# 5. 代码生成（录制操作，自动生成测试代码）
+npx playwright codegen http://localhost:3000
+```
+
+```typescript
+// 在测试代码中暂停（等效于 debugger）
+await page.pause();
+
+// 截图（调试用）
+await page.screenshot({ path: 'debug.png', fullPage: true });
+
+// 打印页面 HTML（排查定位器问题）
+console.log(await page.content());
+```
+
+## 进阶追问
+
+### 视觉回归测试
+
+```typescript
+// 截图对比：捕获 UI 意外变化
+test('首页视觉回归', async ({ page }) => {
+  await page.goto('/');
+
+  // 首次运行生成基准截图
+  // 后续运行与基准对比，像素差异超阈值则失败
+  await expect(page).toHaveScreenshot('homepage.png', {
+    maxDiffPixels: 100,   // 允许 100 个像素差异
+    mask: [page.getByTestId('timestamp')], // 屏蔽动态内容
+  });
+
+  // 组件级截图
+  await expect(page.getByRole('navigation')).toHaveScreenshot('nav.png');
+});
+```
+
+### CI 集成（GitHub Actions）
+
+```yaml
+# .github/workflows/e2e.yml
+name: E2E Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+
+      - run: npm ci
+
+      # 安装 Playwright 浏览器
+      - run: npx playwright install --with-deps chromium
+
+      - name: Run E2E tests
+        run: npx playwright test
+        env:
+          CI: true
+
+      # 上传测试报告（失败时可下载查看）
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
+```
+
+### E2E 测试的常见陷阱
+
+```text
+1. 时间依赖
+   ❌ await page.waitForTimeout(3000);  // 固定等待，不稳定
+   ✅ await expect(locator).toBeVisible(); // 智能等待
+
+2. 测试顺序依赖
+   ❌ 测试 B 依赖测试 A 创建的数据
+   ✅ 每个测试独立准备数据（beforeEach 调 API 或 seed DB）
+
+3. 选择器脆弱
+   ❌ page.locator('div.wrapper > ul > li:nth-child(3) > a')
+   ✅ page.getByRole('link', { name: '第三项' })
+
+4. 测试太多导致 CI 慢
+   ✅ 只测核心路径（登录、支付、核心功能）
+   ✅ 其他场景用单元/集成测试覆盖
+   ✅ 按功能模块并行运行
+
+5. 环境差异
+   ✅ 使用 webServer 配置自动启动 dev server
+   ✅ 测试数据与生产隔离（独立 test DB 或 MSW mock）
+```

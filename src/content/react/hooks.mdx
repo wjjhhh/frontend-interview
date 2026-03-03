@@ -1,134 +1,428 @@
 ---
-title: "React Hooks 原理与最佳实践"
-description: "useState/useEffect 实现原理、自定义 Hooks、常见陷阱"
+title: "React Hooks 深度原理与高频陷阱"
+description: "Hooks 链表结构、闭包陷阱、自定义 Hook 设计、React 19 新 Hooks"
 difficulty: "高级"
-tags: ["Hooks", "useState", "useEffect", "自定义Hook"]
+tags: ["Hooks", "useState", "useEffect", "useActionState", "自定义Hook"]
 category: "react"
 order: 1
 ---
 
-## 核心概念
+## 核心原理：Hooks 链表
 
-React Hooks 是 React 16.8 引入的特性，让函数组件也能使用状态和生命周期。Hooks 的底层基于**链表结构**，每个组件维护一个 Hooks 链表。
+每个函数组件对应一个 Fiber 节点，其 `memoizedState` 属性是一个**单向链表**，每个节点存储一个 Hook 的状态：
 
-### Hooks 规则
+```javascript
+// Hook 节点结构
+{
+  memoizedState: any,   // 当前状态值
+  baseState: any,
+  queue: UpdateQueue,   // 更新队列
+  next: Hook | null,    // 下一个 Hook
+}
+```
 
-1. 只在函数组件或自定义 Hook 的顶层调用
-2. 不要在循环、条件或嵌套函数中调用
-
-这是因为 React 依赖 Hooks 的调用顺序来确定每个 Hook 对应的状态。
+这就是为什么 Hooks **不能放在条件/循环**里——每次渲染必须保证链表顺序一致，否则状态对应关系会错乱。
 
 ## 高频面试题
 
-### 1. useState 的实现原理
+### 1. useState 的批量更新（Batching）
+
+React 18 之前，只在合成事件中自动批处理；**React 18 起，所有更新默认批处理**（包括 setTimeout、Promise、原生事件）。
 
 ```javascript
-// 简化版 useState 实现
-let state = [];
-let stateIndex = 0;
+// React 18：下面只触发一次渲染
+setTimeout(() => {
+  setCount((c) => c + 1);
+  setName('Alice');
+  // 只重渲染一次 ✅
+}, 0);
 
-function useState(initialValue) {
-  const currentIndex = stateIndex;
-  state[currentIndex] = state[currentIndex] ?? initialValue;
+// 如果需要强制立即更新（极少用）
+import { flushSync } from 'react-dom';
+flushSync(() => setCount((c) => c + 1)); // 立即渲染
+flushSync(() => setName('Alice'));        // 再次渲染
+```
 
-  const setState = (newValue) => {
-    if (typeof newValue === 'function') {
-      state[currentIndex] = newValue(state[currentIndex]);
-    } else {
-      state[currentIndex] = newValue;
-    }
-    render(); // 触发重渲染
-  };
+### 2. useEffect vs useLayoutEffect vs useInsertionEffect
 
-  stateIndex++;
-  return [state[currentIndex], setState];
+| Hook | 执行时机 | 是否阻塞绘制 | 典型用途 |
+|------|---------|------------|---------|
+| `useEffect` | 浏览器绘制后（异步） | 否 | 数据请求、订阅 |
+| `useLayoutEffect` | DOM 变更后、绘制前（同步） | 是 | 读取 DOM 尺寸、避免闪烁 |
+| `useInsertionEffect` | DOM 变更前 | 是 | CSS-in-JS 库注入样式 |
+
+```javascript
+// useLayoutEffect：避免闪烁的场景
+function Tooltip({ children, target }) {
+  const ref = useRef(null);
+  const [pos, setPos] = useState({ top: 0, left: 0 });
+
+  useLayoutEffect(() => {
+    // 在绘制前同步读取并设置位置，避免位置跳动
+    const rect = target.getBoundingClientRect();
+    setPos({ top: rect.bottom, left: rect.left });
+  }, [target]);
+
+  return <div ref={ref} style={pos}>{children}</div>;
 }
 ```
 
-### 2. useEffect 的执行时机
-
-- `useEffect(() => {})` — 每次渲染后执行
-- `useEffect(() => {}, [])` — 仅挂载后执行一次
-- `useEffect(() => {}, [dep])` — dep 变化时执行
-- 清理函数在**下次 effect 执行前**或**组件卸载时**调用
+### 3. useRef 的三种用途
 
 ```javascript
-useEffect(() => {
-  const handler = () => console.log('resize');
-  window.addEventListener('resize', handler);
-  return () => window.removeEventListener('resize', handler);
-}, []);
-```
+// 用途1：持久化可变值（不触发渲染）
+const timerRef = useRef(null);
 
-### 3. useRef vs useState
+// 用途2：访问 DOM 元素
+const inputRef = useRef(null);
+inputRef.current.focus();
 
-- `useRef` 不触发重渲染，`.current` 是可变引用
-- `useState` 触发重渲染，值是不可变快照
-
-```javascript
-function Timer() {
-  const countRef = useRef(0);
-  const [count, setCount] = useState(0);
-
+// 用途3：保存上一次的值
+function usePrevious(value) {
+  const ref = useRef();
   useEffect(() => {
-    const id = setInterval(() => {
-      countRef.current += 1;
-      setCount(countRef.current);
-    }, 1000);
-    return () => clearInterval(id);
-  }, []);
-
-  return <span>{count}</span>;
+    ref.current = value;
+  });
+  return ref.current; // 总是比当前值慢一拍
 }
 ```
 
-## 深入追问
-
-### React.memo、useMemo、useCallback 的区别
-
-- **React.memo**: 高阶组件，对 props 浅比较决定是否跳过渲染
-- **useMemo**: 缓存计算结果，依赖变化才重算
-- **useCallback**: 缓存函数引用，本质是 `useMemo(() => fn, deps)`
-
-### 闭包陷阱与解决方案
+### 4. 闭包陷阱的多种解法
 
 ```javascript
-// 问题：count 始终为 0
+// 场景：在定时器中读取最新 state
 function Counter() {
   const [count, setCount] = useState(0);
+  const countRef = useRef(count);
+  countRef.current = count; // 每次渲染同步到 ref
 
   useEffect(() => {
     const id = setInterval(() => {
-      setCount(count + 1); // 闭包捕获旧值
-    }, 1000);
-    return () => clearInterval(id);
-  }, []);
+      // ❌ 闭包陷阱：始终读到旧的 count
+      console.log(count);
 
-  // 解决方案：使用函数式更新
-  useEffect(() => {
-    const id = setInterval(() => {
+      // ✅ 方案1：函数式更新（不需要读取当前值时）
       setCount((prev) => prev + 1);
+
+      // ✅ 方案2：通过 ref 读取最新值
+      console.log(countRef.current);
     }, 1000);
     return () => clearInterval(id);
-  }, []);
+  }, []); // 依赖数组为空
+}
+```
+
+### 5. useMemo 和 useCallback 的正确使用时机
+
+**不要过度优化**——只在以下场景使用：
+
+```javascript
+// ✅ useMemo：计算开销大
+const sortedList = useMemo(
+  () => list.sort((a, b) => b.score - a.score),
+  [list]
+);
+
+// ✅ useCallback：作为子组件 props 传入，子组件用 React.memo 包裹
+const handleClick = useCallback(() => {
+  doSomething(id);
+}, [id]);
+
+// ❌ 不必要的 useCallback（没有 memo 的子组件）
+const fn = useCallback(() => console.log('hi'), []); // 没有意义
+```
+
+## React 19 新 Hooks
+
+### useActionState（原 useFormState）
+
+```javascript
+// 处理表单提交 + 异步状态
+async function submitAction(prevState, formData) {
+  const name = formData.get('name');
+  const result = await api.updateProfile({ name });
+  if (result.error) return { error: result.error };
+  return { success: true };
+}
+
+function ProfileForm() {
+  const [state, action, isPending] = useActionState(submitAction, null);
+
+  return (
+    <form action={action}>
+      <input name="name" />
+      <button disabled={isPending}>
+        {isPending ? '提交中...' : '提交'}
+      </button>
+      {state?.error && <p>{state.error}</p>}
+    </form>
+  );
+}
+```
+
+### useOptimistic
+
+```javascript
+// 乐观更新：提交前立即展示预期结果
+function MessageList({ messages, sendMessage }) {
+  const [optimisticMessages, addOptimistic] = useOptimistic(
+    messages,
+    (state, newMsg) => [...state, { ...newMsg, pending: true }]
+  );
+
+  async function handleSend(formData) {
+    const text = formData.get('text');
+    addOptimistic({ text }); // 立即显示
+    await sendMessage(text); // 实际发送
+  }
+
+  return (
+    <form action={handleSend}>
+      {optimisticMessages.map((msg) => (
+        <p key={msg.id} style={{ opacity: msg.pending ? 0.5 : 1 }}>
+          {msg.text}
+        </p>
+      ))}
+      <input name="text" />
+    </form>
+  );
+}
+```
+
+### use()
+
+```javascript
+// 在渲染中读取 Promise 或 Context
+function UserProfile({ userPromise }) {
+  const user = use(userPromise); // 自动 Suspense
+  return <h1>{user.name}</h1>;
+}
+
+// 条件读取 Context（突破 Hooks 规则限制）
+function ThemeButton({ showTheme }) {
+  if (showTheme) {
+    const theme = use(ThemeContext); // ✅ 可以放在条件里
+    return <button style={{ color: theme.color }}>按钮</button>;
+  }
+  return <button>按钮</button>;
+}
+```
+
+## 进阶面试题
+
+### 6. useDeferredValue vs startTransition
+
+两者都用于标记"低优先级更新"，适用场景不同：
+
+| | `startTransition` | `useDeferredValue` |
+|--|--|--|
+| 控制点 | 更新的**触发方** | 更新的**接收方** |
+| 使用场景 | 能控制 setState 的地方 | 来自 props / 无法控制的值 |
+| isPending | ✅ `useTransition` 提供 | ❌ 需手动 `value !== deferred` |
+
+```tsx
+// startTransition：控制自己的 setState
+function SearchBox() {
+  const [query, setQuery] = useState('');
+  const [isPending, startTransition] = useTransition();
+
+  function handleChange(e) {
+    setQuery(e.target.value); // 紧急：立即更新输入框
+    startTransition(() => {
+      setResults(search(e.target.value)); // 低优先级：可被中断
+    });
+  }
+}
+
+// useDeferredValue：接收来自 props 的值
+function SearchResults({ query }) {
+  // query 来自父组件，无法控制其更新优先级
+  const deferredQuery = useDeferredValue(query);
+  const isStale = query !== deferredQuery; // 是否正在 pending
+
+  return (
+    <div style={{ opacity: isStale ? 0.5 : 1, transition: 'opacity 0.2s' }}>
+      <SlowList query={deferredQuery} />
+    </div>
+  );
+}
+```
+
+> **底层原理**：`useDeferredValue` 不是防抖，没有固定延迟。它触发一次低优先级重渲染；期间有高优先级任务则中断，优先处理后继续。配合 `React.memo` 包裹 `<SlowList>` 才能真正跳过不必要渲染。
+
+### 7. useImperativeHandle：精确控制暴露给父组件的 API
+
+```tsx
+interface VideoHandle {
+  play: () => void;
+  pause: () => void;
+  seek: (time: number) => void;
+}
+
+// forwardRef + useImperativeHandle：只暴露需要的方法，隐藏内部 DOM
+const VideoPlayer = forwardRef<VideoHandle, { src: string }>(
+  function VideoPlayer({ src }, ref) {
+    const videoRef = useRef<HTMLVideoElement>(null);
+
+    useImperativeHandle(ref, () => ({
+      play: () => videoRef.current?.play(),
+      pause: () => videoRef.current?.pause(),
+      seek: (time) => {
+        if (videoRef.current) videoRef.current.currentTime = time;
+      },
+      // 不直接暴露 videoRef.current，防止父组件随意操作 DOM
+    }), []); // 依赖数组同 useMemo
+
+    return <video ref={videoRef} src={src} />;
+  }
+);
+
+function App() {
+  const playerRef = useRef<VideoHandle>(null);
+  return (
+    <>
+      <VideoPlayer ref={playerRef} src="/video.mp4" />
+      <button onClick={() => playerRef.current?.seek(30)}>跳到30秒</button>
+    </>
+  );
+}
+```
+
+> React 19 起，`forwardRef` 可以直接用 `ref` 作为普通 prop，无需包装：
+> ```tsx
+> function VideoPlayer({ src, ref }: { src: string; ref: React.Ref<VideoHandle> }) { ... }
+> ```
+
+### 8. useId：解决 SSR 水合 ID 不一致
+
+```tsx
+// ❌ 用 Math.random() 或模块级计数器：SSR 和 CSR 生成 ID 不同 → 水合报错
+function Input({ label }) {
+  const id = Math.random(); // SSR: 0.123, CSR 重新执行: 0.456 → mismatch!
+  return <><label htmlFor={id}>{label}</label><input id={id} /></>;
+}
+
+// ✅ useId：SSR 和 CSR 生成完全一致的 ID（基于组件树位置）
+function Input({ label }) {
+  const id = useId(); // ":r0:", ":r1:" 稳定 ID
+  return <><label htmlFor={id}>{label}</label><input id={id} /></>;
+}
+
+// 一个组件内需要多个关联 ID：共享同一个 base
+function RangeField() {
+  const id = useId();
+  return (
+    <>
+      <label htmlFor={`${id}-min`}>最小值</label>
+      <input id={`${id}-min`} aria-describedby={`${id}-hint`} />
+      <label htmlFor={`${id}-max`}>最大值</label>
+      <input id={`${id}-max`} aria-describedby={`${id}-hint`} />
+      <p id={`${id}-hint`}>请输入有效范围</p>
+    </>
+  );
+}
+```
+
+### 9. 高级自定义 Hook：useAsync（防竞态条件）
+
+```tsx
+// 竞态问题：userId 从 1 快速切换到 2，请求 2 先返回，请求 1 后返回 → 显示错误数据
+// 解决：通过 cancelled 标志位忽略过期请求
+
+type AsyncState<T> =
+  | { status: 'idle' }
+  | { status: 'pending' }
+  | { status: 'resolved'; data: T }
+  | { status: 'rejected'; error: Error };
+
+function useAsync<T>(asyncFn: () => Promise<T>, deps: React.DependencyList) {
+  const [state, setState] = useState<AsyncState<T>>({ status: 'idle' });
+
+  useEffect(() => {
+    let cancelled = false;
+    setState({ status: 'pending' });
+
+    asyncFn()
+      .then((data) => {
+        if (!cancelled) setState({ status: 'resolved', data });
+      })
+      .catch((error) => {
+        if (!cancelled) setState({ status: 'rejected', error });
+      });
+
+    return () => {
+      cancelled = true; // deps 变化或组件卸载时，标记旧请求为无效
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, deps);
+
+  return state;
+}
+
+// 使用
+function UserCard({ userId }: { userId: number }) {
+  const state = useAsync(() => fetchUser(userId), [userId]);
+
+  if (state.status === 'pending') return <Skeleton />;
+  if (state.status === 'rejected') return <p>Error: {state.error.message}</p>;
+  if (state.status === 'resolved') return <div>{state.data.name}</div>;
+  return null;
+}
+```
+
+### React 19：useFormStatus
+
+```tsx
+// useFormStatus 必须在 <form> 的**子组件**中使用
+// 读取最近的父级 form 提交状态，避免 props 传递
+import { useFormStatus } from 'react-dom';
+
+function SubmitButton() {
+  const { pending } = useFormStatus();
+  // pending: form 正在提交时为 true
+  return (
+    <button type="submit" disabled={pending}>
+      {pending ? '提交中...' : '提交'}
+    </button>
+  );
+}
+
+function ContactForm() {
+  return (
+    <form action={submitAction}>
+      <input name="email" type="email" />
+      <SubmitButton /> {/* 无需从父组件传 isPending ✅ */}
+    </form>
+  );
 }
 ```
 
 ## 手写练习
 
-> 实现一个 `useDebounce` 自定义 Hook：
+> 实现 `useLocalStorage`，状态持久化到 localStorage：
 
 ```javascript
-function useDebounce(value, delay) {
-  const [debouncedValue, setDebouncedValue] = useState(value);
+function useLocalStorage(key, initialValue) {
+  const [storedValue, setStoredValue] = useState(() => {
+    try {
+      const item = localStorage.getItem(key);
+      return item ? JSON.parse(item) : initialValue;
+    } catch {
+      return initialValue;
+    }
+  });
 
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      setDebouncedValue(value);
-    }, delay);
-    return () => clearTimeout(timer);
-  }, [value, delay]);
+  const setValue = useCallback(
+    (value) => {
+      const valueToStore = value instanceof Function
+        ? value(storedValue)
+        : value;
+      setStoredValue(valueToStore);
+      localStorage.setItem(key, JSON.stringify(valueToStore));
+    },
+    [key, storedValue]
+  );
 
-  return debouncedValue;
+  return [storedValue, setValue];
 }
 ```
