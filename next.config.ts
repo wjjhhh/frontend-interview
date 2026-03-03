@@ -1,14 +1,11 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  // Enable static export for Vercel edge network
-  // output: 'export', // Uncomment for full static export
+  output: "export",
+  basePath: "/frontend-interview",
   images: {
     formats: ["image/avif", "image/webp"],
-  },
-  // Experimental features
-  experimental: {
-    // mdxRs: true, // Use Rust-based MDX compiler if needed
+    unoptimized: true,
   },
 };
 
