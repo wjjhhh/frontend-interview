@@ -1,0 +1,321 @@
+---
+title: "CSS 工程化方案全解"
+description: "CSS Modules、CSS-in-JS、预处理器、原子化CSS的原理、优缺点与选型建议"
+difficulty: "中级"
+tags: ["CSS Modules", "CSS-in-JS", "Sass", "PostCSS", "TailwindCSS", "UnoCSS", "样式方案"]
+category: "css"
+order: 2
+---
+
+## 为什么需要 CSS 方案？
+
+原生 CSS 的核心问题：
+
+```text
+1. 全局污染：所有样式共享同一命名空间，类名冲突难以避免
+2. 死代码难删除：不确定哪些样式在用，不敢删
+3. 缺乏逻辑能力：无法动态计算、复用逻辑
+4. 依赖管理缺失：无法像 JS 模块一样显式声明依赖
+```
+
+主流解决方案对比：
+
+```text
+┌──────────────────┬────────────────────────────┬──────────────┐
+│ 方案              │ 代表工具                    │ 隔离方式      │
+├──────────────────┼────────────────────────────┼──────────────┤
+│ CSS 预处理器      │ Sass / Less / Stylus       │ 无（需约定）  │
+│ CSS Modules      │ 内置于 Vite/CRA/Next.js    │ 哈希类名      │
+│ CSS-in-JS        │ styled-components / emotion │ 动态类名      │
+│ 原子化 CSS        │ TailwindCSS / UnoCSS       │ 单一职责类    │
+│ Shadow DOM       │ Web Components             │ 浏览器原生隔离 │
+└──────────────────┴────────────────────────────┴──────────────┘
+```
+
+## 高频面试题
+
+### 1. CSS Modules 原理
+
+```css
+/* Button.module.css */
+.btn {
+  padding: 8px 16px;
+  background: blue;
+}
+
+.btn:hover {
+  background: darkblue;
+}
+```
+
+```tsx
+// Button.tsx
+import styles from './Button.module.css';
+
+// 编译后 styles.btn → "Button_btn__xK9mA"（哈希唯一类名）
+export const Button = () => (
+  <button className={styles.btn}>Click</button>
+);
+```
+
+**编译产物：**
+
+```css
+/* 构建后全局 CSS（类名已被哈希处理） */
+.Button_btn__xK9mA {
+  padding: 8px 16px;
+  background: blue;
+}
+.Button_btn__xK9mA:hover {
+  background: darkblue;
+}
+```
+
+**组合（composes）：**
+
+```css
+/* 复用其他模块的样式 */
+.primaryBtn {
+  composes: btn from './base.module.css';
+  color: white;
+}
+```
+
+**:global 逃逸：**
+
+```css
+/* 需要覆盖第三方组件样式时 */
+.wrapper :global(.ant-btn) {
+  border-radius: 8px;
+}
+```
+
+### 2. CSS-in-JS：styled-components vs emotion
+
+**styled-components 核心原理：**
+
+```tsx
+import styled from 'styled-components';
+
+// 1. 运行时生成唯一类名（如 sc-abc123）
+// 2. 插入 <style> 标签到 <head>
+// 3. 支持 props 动态样式
+
+const Button = styled.button<{ $primary?: boolean }>`
+  padding: 8px 16px;
+  background: ${(props) => (props.$primary ? 'blue' : 'white')};
+  color: ${(props) => (props.$primary ? 'white' : 'blue')};
+  border: 2px solid blue;
+
+  &:hover {
+    opacity: 0.8;
+  }
+
+  /* 响应式 */
+  @media (max-width: 768px) {
+    padding: 4px 8px;
+  }
+`;
+
+// 使用
+<Button $primary>Primary</Button>
+<Button>Secondary</Button>
+```
+
+**运行时 vs 编译时 CSS-in-JS：**
+
+```text
+运行时（styled-components、emotion）：
+  优点：完全动态，支持 props 驱动样式
+  缺点：
+    - JS bundle 中包含样式逻辑
+    - 每次渲染计算 CSS，有运行时开销
+    - SSR 需要额外配置（收集样式注入 HTML）
+
+编译时（vanilla-extract、Linaria）：
+  优点：零运行时，样式在构建时提取为静态 CSS 文件
+  缺点：不支持纯动态样式（只能用 CSS 变量模拟）
+```
+
+**vanilla-extract（编译时 CSS-in-JS）：**
+
+```typescript
+// styles.css.ts（构建时编译为静态 CSS）
+import { style, createVar } from '@vanilla-extract/css';
+
+const accentColor = createVar();
+
+export const button = style({
+  padding: '8px 16px',
+  vars: {
+    [accentColor]: 'blue',
+  },
+  background: accentColor,
+  selectors: {
+    '&:hover': {
+      opacity: 0.8,
+    },
+  },
+});
+```
+
+### 3. CSS 预处理器（Sass / Less / PostCSS）
+
+**Sass 核心能力：**
+
+```scss
+// 1. 变量
+$primary: #3b82f6;
+$border-radius: 8px;
+
+// 2. 嵌套（注意不要嵌套过深，生成选择器权重过高）
+.card {
+  padding: 16px;
+  border-radius: $border-radius;
+
+  &__title {
+    font-size: 18px;
+    color: darken($primary, 10%);
+  }
+
+  &--featured {
+    border: 2px solid $primary;
+  }
+}
+
+// 3. Mixin（可复用的样式块）
+@mixin flex-center($direction: row) {
+  display: flex;
+  flex-direction: $direction;
+  justify-content: center;
+  align-items: center;
+}
+
+.hero {
+  @include flex-center(column);
+  min-height: 100vh;
+}
+
+// 4. 函数
+@function rem($px) {
+  @return #{$px / 16}rem;
+}
+
+.title {
+  font-size: rem(24); // → 1.5rem
+}
+
+// 5. 继承
+%button-base {
+  cursor: pointer;
+  border: none;
+  padding: 8px 16px;
+}
+
+.btn-primary {
+  @extend %button-base;
+  background: $primary;
+}
+```
+
+**PostCSS：CSS 的 Babel**
+
+```javascript
+// postcss.config.js
+module.exports = {
+  plugins: [
+    // 自动添加浏览器前缀
+    require('autoprefixer'),
+
+    // 支持未来 CSS 语法（嵌套、自定义媒体查询等）
+    require('postcss-preset-env')({ stage: 3 }),
+
+    // 将 px 转为 rem（移动端适配）
+    require('postcss-pxtorem')({
+      rootValue: 16,
+      propList: ['*'],
+    }),
+  ],
+};
+```
+
+### 4. 方案选型建议
+
+```text
+场景                          推荐方案
+─────────────────────────────────────────────────────────
+React 应用，样式逻辑复杂       CSS Modules + Sass
+                              或 vanilla-extract（TypeScript 友好）
+
+需要主题切换、动态样式          CSS 变量 + CSS Modules
+                              或 styled-components（小型项目）
+
+组件库开发                     CSS Modules 或 vanilla-extract
+                              （避免运行时开销，兼容性更好）
+
+快速原型 / 中后台系统           TailwindCSS（开发速度极快）
+
+性能敏感 / 超大规模项目         UnoCSS（按需生成，极小体积）
+
+需要精细控制动画、媒体查询       Sass（逻辑能力强）
+
+Vue 项目                       Scoped CSS（<style scoped>）
+                              + Sass 预处理
+```
+
+## 深入追问
+
+### CSS Modules 与 Scoped CSS 的区别
+
+```text
+CSS Modules：
+  - 构建时处理，生成哈希类名
+  - 框架无关（React/Vue 均可用）
+  - composes 实现样式复用
+
+Vue Scoped CSS（<style scoped>）：
+  - 编译时给元素添加 data-v-xxxxxx 属性
+  - 给 CSS 选择器追加属性选择器：.btn[data-v-xxxxxx]
+  - 只影响当前组件，子组件根元素也会受影响
+  - 用 :deep() 穿透子组件样式
+```
+
+```vue
+<style scoped>
+/* 编译后：.btn[data-v-7ba5bd90] */
+.btn { color: red; }
+
+/* 穿透子组件 */
+:deep(.child-class) { color: blue; }
+
+/* 全局样式 */
+:global(.global-class) { color: green; }
+</style>
+```
+
+### CSS-in-JS 在 React Server Components 中的问题
+
+```text
+问题：styled-components、emotion 等运行时方案依赖 React Context
+     和 useInsertionEffect，而 RSC 不能使用 hooks
+
+解决方案：
+  1. 只在客户端组件（'use client'）中使用 CSS-in-JS
+  2. 改用编译时方案：vanilla-extract、Linaria（生成静态 CSS 文件）
+  3. 改用 CSS Modules 或 TailwindCSS（完全无运行时）
+```
+
+### 性能角度：哪种方案 CSS 体积最小？
+
+```text
+原子化 CSS（TailwindCSS/UnoCSS）：
+  - 所有组件共享同一份原子类，高度复用
+  - 项目越大，新增样式越少（复用已有原子类）
+  - 通常 < 20KB gzip
+
+CSS Modules / CSS-in-JS：
+  - 每个组件独立样式，随组件数量线性增长
+  - 大型项目可能 100KB+
+
+原子化 CSS 在大型项目中体积优势显著。
+```

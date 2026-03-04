@@ -283,6 +283,186 @@ function buildIframeSrc(code: string): string {
 }
 ```
 
+### 8. 终极优化：iframe 静态壳 + postMessage
+
+上面 srcdoc 方案的致命问题：**每次代码变动都重建 iframe，导致 React、Babel 等 CDN 资源反复加载**。
+
+```text
+srcdoc 方案（每次重建）：
+  用户输入 → 防抖 600ms → 重建整个 iframe HTML → 浏览器解析
+  → 重新加载 React CDN ← 命中缓存但仍需解析执行 ~100ms
+  → 重新加载 Babel CDN ← 命中缓存但仍需解析执行 ~200ms
+  → 编译用户代码 → 渲染
+
+postMessage 方案（只加载一次）：
+  iframe 初始化时加载一次 React + Babel（静态壳）
+  → 用户输入 → 防抖 600ms → postMessage 传代码
+  → iframe 内部编译 + 渲染 ← 无需重新加载任何资源，~10ms
+```
+
+**核心架构：**
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│  主页面                                                       │
+│                                                              │
+│  ┌───────────────┐    postMessage({ type:'run', code })      │
+│  │  代码编辑器    │  ─────────────────────────────────────▶   │
+│  └───────────────┘                                           │
+│                       postMessage({ type:'iframe-ready' })   │
+│  ┌───────────────┐  ◀─────────────────────────────────────   │
+│  │  iframe 预览   │    iframe 静态壳（只加载一次，常驻内存）    │
+│  │  sandbox=      │    · React + ReactDOM（CDN，一次性加载）  │
+│  │  allow-scripts │    · @babel/standalone（CDN，一次性加载） │
+│  └───────────────┘    · runCode() 接收代码，编译执行          │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Step 1：iframe 静态壳（只初始化一次）**
+
+```html
+<!-- 这个 HTML 通过 srcdoc 注入一次，之后永不重建 -->
+<!DOCTYPE html>
+<html>
+<head>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <div id="error" style="display:none"></div>
+  <script>
+    var reactRoot = null;
+    // 预解构 Hooks，用户代码无需 import
+    var HOOKS = ['useState','useEffect','useRef','useMemo',
+                 'useCallback','useReducer','useContext'];
+
+    function runCode(code) {
+      // 清除旧错误
+      document.getElementById('error').style.display = 'none';
+
+      // 卸载旧组件（避免内存泄漏和状态残留）
+      if (reactRoot) {
+        try { reactRoot.unmount(); } catch(e) {}
+        reactRoot = null;
+      }
+      document.getElementById('root').innerHTML = '';
+
+      try {
+        // Babel 编译 JSX → JS（Babel 已在内存中，无需重新加载）
+        var transformed = Babel.transform(code, { presets: ['react'] }).code;
+
+        // 构建沙箱作用域
+        var scope = { React: React, ReactDOM: ReactDOM };
+        HOOKS.forEach(function(h) { if (React[h]) scope[h] = React[h]; });
+
+        // 执行编译后的代码，获取 App 组件
+        var keys = Object.keys(scope);
+        var vals = keys.map(function(k) { return scope[k]; });
+        var fn = new Function(keys.join(','),
+          transformed + '\nreturn typeof App !== "undefined" ? App : null;');
+        var App = fn.apply(null, vals);
+
+        // 渲染
+        if (App) {
+          reactRoot = ReactDOM.createRoot(document.getElementById('root'));
+          reactRoot.render(React.createElement(App));
+        }
+      } catch(e) {
+        document.getElementById('error').style.display = 'block';
+        document.getElementById('error').textContent = e.toString();
+      }
+    }
+
+    // 监听主页面发来的代码
+    window.addEventListener('message', function(e) {
+      if (e.data && e.data.type === 'run') runCode(e.data.code);
+    });
+
+    // 通知主页面：iframe 已就绪（CDN 资源加载完成）
+    window.parent.postMessage({ type: 'iframe-ready' }, '*');
+  </script>
+</body>
+</html>
+```
+
+**Step 2：主页面通信逻辑**
+
+```tsx
+function ReactPlayground() {
+  const [code, setCode] = useState(defaultCode);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const iframeReadyRef = useRef(false);
+  const codeRef = useRef(code);
+  const debounceRef = useRef<ReturnType<typeof setTimeout>>();
+
+  // 保持 ref 同步（闭包陷阱防护）
+  useEffect(() => { codeRef.current = code; }, [code]);
+
+  // 监听 iframe 就绪信号
+  useEffect(() => {
+    function handleMessage(e: MessageEvent) {
+      if (e.data?.type === 'iframe-ready') {
+        iframeReadyRef.current = true;
+        // 就绪后立即发送当前代码（首次渲染）
+        iframeRef.current?.contentWindow?.postMessage(
+          { type: 'run', code: codeRef.current }, '*'
+        );
+      }
+    }
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, []);
+
+  // 代码变动后 600ms 通过 postMessage 更新（不重建 iframe）
+  useEffect(() => {
+    clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => {
+      if (iframeReadyRef.current) {
+        iframeRef.current?.contentWindow?.postMessage(
+          { type: 'run', code }, '*'
+        );
+      }
+    }, 600);
+    return () => clearTimeout(debounceRef.current);
+  }, [code]);
+
+  return (
+    <>
+      <textarea value={code} onChange={(e) => setCode(e.target.value)} />
+      {/* srcdoc 只设置一次，之后 iframe 常驻内存 */}
+      <iframe ref={iframeRef} srcDoc={IFRAME_SHELL} sandbox="allow-scripts" />
+    </>
+  );
+}
+```
+
+**关键设计点：**
+
+```text
+1. iframe-ready 握手
+   iframe 加载完 CDN 后主动通知主页面 → 主页面才开始发送代码
+   避免 postMessage 发早了、iframe 还没准备好的时序问题
+
+2. 旧组件卸载
+   每次 runCode 前调用 reactRoot.unmount()
+   防止多次渲染导致内存泄漏和状态残留
+
+3. new Function 沙箱
+   用 new Function 而非 eval，显式传入作用域变量
+   用户代码只能访问注入的 React/Hooks，不能访问 iframe 的全局变量
+
+4. ref 同步
+   codeRef.current 始终指向最新代码
+   解决 iframe-ready 回调中闭包捕获旧值的问题
+
+5. 性能对比
+   srcdoc 重建：每次 ~300ms（CDN 解析 + Babel 初始化 + 编译 + 渲染）
+   postMessage：每次 ~10ms（仅编译 + 渲染）
+   提升约 30 倍
+```
+
 ## 深入追问
 
 ### 如何支持多文件（App.jsx + utils.js）？
@@ -307,25 +487,146 @@ Sandpack 架构：
 ### 生产级 Playground 的优化方向
 
 ```text
-1. 编辑器升级
+1. iframe 静态壳 + postMessage（上文第 8 节已实现）
+   一次性加载 CDN 资源，后续代码更新只通过消息传递
+   性能提升 ~30 倍，是最关键的架构优化
+
+2. 编辑器升级
    textarea → Monaco Editor（VS Code 同款，有语法高亮、自动补全）
    但 Monaco 体积 ~2MB，需要 Web Worker 加载
 
-2. CDN 资源预加载
+3. CDN 资源预加载
    在页面初始化时预加载 Babel + React CDN 资源
    <link rel="preload" href="https://unpkg.com/@babel/standalone/...">
 
-3. 编译移至 Web Worker
+4. 编译移至 Web Worker
    将 Babel.transform 放到 Worker 线程
    避免大型代码编译时阻塞主线程 UI
 
-4. TypeScript 支持
+5. TypeScript 支持
    @babel/standalone 支持 data-presets="typescript,react"
    或使用 @typescript/vfs + TypeScript compiler API
 
-5. 错误提示增强
+6. 错误提示增强
    解析 Babel 编译错误的 loc（行列号）
    在编辑器对应位置显示红色波浪线
+```
+
+### esm.sh 方案：运行时按需加载 npm 依赖
+
+上述方案用 unpkg 加载的是 **UMD 格式**（挂载到 `window.React`），而 esm.sh 提供另一种思路：把 npm 包实时转换为 **ES Module 格式**，让浏览器原生 `import`。
+
+**为什么浏览器能直接 import esm.sh 的 URL？**
+
+```html
+<script type="module">
+  // 浏览器看到完整 URL，直接发 HTTP 请求取回模块
+  import React from 'https://esm.sh/react@18'
+  import { useState } from 'https://esm.sh/react@18'
+</script>
+```
+
+浏览器原生支持 `type="module"` + URL import，不需要 bundler，不需要 node_modules。esm.sh 在服务端把 npm 的 CJS 格式实时转换成 ESM：
+
+```js
+// npm 原始包（CJS）
+const React = require('./react')
+module.exports = React
+
+// esm.sh 返回的（ESM）
+export default React
+export { useState, useEffect, ... }
+```
+
+**加载链路：**
+
+```text
+import 'https://esm.sh/react'
+        ↓
+  浏览器发 GET 请求
+        ↓
+  esm.sh 服务器检查缓存
+  → 没有：拉 npm 包 → 转成 ESM → 返回
+  → 有：直接返回缓存
+        ↓
+  浏览器解析 JS，遇到子依赖继续发请求（瀑布式）
+        ↓
+  所有模块就绪 → 代码执行
+```
+
+**在 Playground 中的用法：**
+
+```js
+// 把用户代码里的裸模块名替换为 esm.sh URL
+// import React from 'react'  →  import React from 'https://esm.sh/react'
+
+const transformed = userCode.replace(
+  /from ['"]([^./][^'"]*)['"]/g,
+  (_, pkg) => `from 'https://esm.sh/${pkg}'`
+)
+```
+
+配合 Import Map 更优雅：
+
+```html
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18",
+    "react-dom": "https://esm.sh/react-dom@18"
+  }
+}
+</script>
+<script type="module">
+  import React from 'react'  // 自动映射到 esm.sh
+</script>
+```
+
+**网络慢会怎样？**
+
+```text
+问题1：模块加载超时，import 语句挂起，预览区白屏
+问题2：依赖链长时（A 依赖 B 依赖 C），每个都要单独请求，瀑布式延迟叠加
+问题3：esm.sh 是动态转换服务，响应时间不稳定，不像静态 CDN 有缓存保证
+问题4：超时后直接抛错（Failed to fetch dynamically imported module），无自动重试
+```
+
+应对方案：
+- 换更快的 CDN（jsDelivr: `cdn.jsdelivr.net/npm/react/+esm`）
+- Service Worker 缓存 esm.sh 响应，首次慢但之后秒开
+- 切换为 esbuild-wasm 本地打包，彻底摆脱运行时网络依赖
+
+**浏览器与 Node.js 兼容性：**
+
+```text
+浏览器支持（原生 ESM URL import）：
+  Chrome 61+（2017）  ✅
+  Firefox 60+（2018）  ✅
+  Safari 10.1+（2017）  ✅
+  Edge 16+（2017）  ✅
+  IE  ✗  完全不支持（已死）
+  → 现在基本无限制
+
+Node.js：
+  无法直接 import URL，这是浏览器独有能力
+  import React from 'https://esm.sh/react'  // Node.js ❌ 报错
+  // Error: Only file: and data: URLs are supported
+  → esm.sh 方案是纯浏览器方案，与 Node 版本无关
+```
+
+**与 UMD 方案对比：**
+
+```text
+UMD（unpkg）：
+  <script src="unpkg.com/react"></script>
+  → 挂载到 window.React 全局变量
+  → 所有依赖一次性加载，简单可控
+
+esm.sh（ESM）：
+  import React from 'https://esm.sh/react'
+  → 通过模块系统加载，天然 tree-shaking
+  → 支持按需加载任意 npm 包，适合多依赖场景
+  → 但依赖运行时网络，延迟不可控
 ```
 
 ### CodeSandbox / StackBlitz 的底层方案对比

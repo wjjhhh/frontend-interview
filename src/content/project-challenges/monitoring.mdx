@@ -1,0 +1,420 @@
+---
+title: "前端监控与异常处理体系"
+description: "错误捕获、性能监控、行为埋点、上报策略、SourceMap 还原、告警系统"
+difficulty: "高级"
+tags: ["前端监控", "错误捕获", "性能监控", "埋点", "SourceMap"]
+category: "project-challenges"
+order: 5
+---
+
+## 问题背景
+
+线上项目出了问题，用户只会说"页面白了"、"按钮点不了"。没有完善的监控体系，排查问题就像在黑暗中摸索。核心难点是**如何全面捕获错误、监控性能、采集行为数据，并在不影响用户体验的前提下高效上报**。
+
+## 高频面试题
+
+### 1. 错误捕获全覆盖
+
+```javascript
+// ① JS 运行时错误
+window.onerror = (message, source, lineno, colno, error) => {
+  report({
+    type: 'js_error',
+    message,
+    source,
+    lineno,
+    colno,
+    stack: error?.stack,
+  });
+  // 返回 true 可阻止控制台报错
+};
+
+// ② Promise 未捕获异常
+window.addEventListener('unhandledrejection', (event) => {
+  report({
+    type: 'promise_error',
+    reason: event.reason?.stack || String(event.reason),
+  });
+});
+
+// ③ 资源加载错误（图片、脚本、样式加载失败）
+// 注意：资源错误不会冒泡到 window.onerror，必须在捕获阶段监听
+window.addEventListener('error', (event) => {
+  const target = event.target;
+  if (target instanceof HTMLElement) {
+    report({
+      type: 'resource_error',
+      tagName: target.tagName,
+      src: target.src || target.href,
+    });
+  }
+}, true); // 第三个参数 true = 捕获阶段
+
+// ④ React 错误边界（捕获渲染阶段错误）
+class ErrorBoundary extends React.Component {
+  state = { hasError: false };
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error, errorInfo) {
+    report({
+      type: 'react_error',
+      message: error.message,
+      stack: error.stack,
+      componentStack: errorInfo.componentStack, // React 组件调用栈
+    });
+  }
+
+  render() {
+    if (this.state.hasError) return <ErrorFallback />;
+    return this.props.children;
+  }
+}
+
+// ⑤ 接口请求错误（拦截 fetch/XHR）
+const originalFetch = window.fetch;
+window.fetch = async (...args) => {
+  const startTime = performance.now();
+  try {
+    const response = await originalFetch(...args);
+    const duration = performance.now() - startTime;
+
+    if (!response.ok) {
+      report({
+        type: 'api_error',
+        url: args[0],
+        status: response.status,
+        duration,
+      });
+    }
+    return response;
+  } catch (error) {
+    report({
+      type: 'api_error',
+      url: args[0],
+      message: error.message,
+      duration: performance.now() - startTime,
+    });
+    throw error;
+  }
+};
+```
+
+### 2. 性能指标采集（Web Vitals）
+
+```typescript
+// 使用 PerformanceObserver 采集核心指标
+function collectWebVitals() {
+  // LCP（Largest Contentful Paint）—— 最大内容绘制
+  new PerformanceObserver((list) => {
+    const entries = list.getEntries();
+    const lastEntry = entries[entries.length - 1];
+    report({
+      type: 'performance',
+      metric: 'LCP',
+      value: lastEntry.startTime,
+      element: lastEntry.element?.tagName,
+    });
+  }).observe({ type: 'largest-contentful-paint', buffered: true });
+
+  // FID（First Input Delay）—— 首次输入延迟
+  new PerformanceObserver((list) => {
+    const entry = list.getEntries()[0];
+    report({
+      type: 'performance',
+      metric: 'FID',
+      value: entry.processingStart - entry.startTime,
+    });
+  }).observe({ type: 'first-input', buffered: true });
+
+  // CLS（Cumulative Layout Shift）—— 累计布局偏移
+  let clsValue = 0;
+  new PerformanceObserver((list) => {
+    for (const entry of list.getEntries()) {
+      if (!entry.hadRecentInput) {
+        clsValue += entry.value;
+      }
+    }
+    report({ type: 'performance', metric: 'CLS', value: clsValue });
+  }).observe({ type: 'layout-shift', buffered: true });
+
+  // 页面加载关键时间点
+  window.addEventListener('load', () => {
+    const timing = performance.getEntriesByType('navigation')[0];
+    report({
+      type: 'performance',
+      metric: 'page_load',
+      dns: timing.domainLookupEnd - timing.domainLookupStart,
+      tcp: timing.connectEnd - timing.connectStart,
+      ttfb: timing.responseStart - timing.requestStart,
+      domReady: timing.domContentLoadedEventEnd - timing.startTime,
+      loadComplete: timing.loadEventEnd - timing.startTime,
+    });
+  });
+}
+```
+
+### 3. 用户行为埋点
+
+```typescript
+// 行为追踪器
+class Tracker {
+  private queue: any[] = [];
+  private timer?: ReturnType<typeof setTimeout>;
+
+  // 点击事件自动采集（无侵入）
+  initAutoTrack() {
+    document.addEventListener('click', (event) => {
+      const target = event.target as HTMLElement;
+      const trackData = target.closest('[data-track]');
+
+      if (trackData) {
+        this.push({
+          type: 'click',
+          event: trackData.getAttribute('data-track'),
+          text: target.innerText?.slice(0, 50),
+          path: this.getXPath(target),
+          timestamp: Date.now(),
+        });
+      }
+    });
+  }
+
+  // 页面访问追踪（SPA 路由变化）
+  initPageView() {
+    let lastPath = location.pathname;
+    const reportPV = () => {
+      if (location.pathname !== lastPath) {
+        this.push({
+          type: 'page_view',
+          from: lastPath,
+          to: location.pathname,
+          timestamp: Date.now(),
+        });
+        lastPath = location.pathname;
+      }
+    };
+
+    // 监听 pushState / popstate
+    const originalPushState = history.pushState;
+    history.pushState = function (...args) {
+      originalPushState.apply(this, args);
+      reportPV();
+    };
+    window.addEventListener('popstate', reportPV);
+  }
+
+  // 获取元素唯一路径
+  private getXPath(element: HTMLElement): string {
+    const parts: string[] = [];
+    while (element && element !== document.body) {
+      let selector = element.tagName.toLowerCase();
+      if (element.id) {
+        selector += `#${element.id}`;
+        parts.unshift(selector);
+        break;
+      }
+      parts.unshift(selector);
+      element = element.parentElement!;
+    }
+    return parts.join(' > ');
+  }
+
+  push(data: any) {
+    this.queue.push(data);
+    // 批量上报：积累 10 条或 5 秒上报一次
+    if (this.queue.length >= 10) {
+      this.flush();
+    } else if (!this.timer) {
+      this.timer = setTimeout(() => this.flush(), 5000);
+    }
+  }
+
+  flush() {
+    if (this.queue.length === 0) return;
+    const batch = [...this.queue];
+    this.queue = [];
+    clearTimeout(this.timer);
+    this.timer = undefined;
+    sendBeacon('/api/track', batch);
+  }
+}
+```
+
+### 4. 上报策略
+
+```typescript
+// 上报方式选择
+function sendReport(data: any) {
+  const payload = JSON.stringify(data);
+
+  // 方案1：sendBeacon（页面关闭时也能发送，推荐）
+  if (navigator.sendBeacon) {
+    navigator.sendBeacon('/api/report', payload);
+    return;
+  }
+
+  // 方案2：Image Beacon（兼容性最好，不受跨域限制）
+  const img = new Image();
+  img.src = `/api/report?data=${encodeURIComponent(payload)}`;
+
+  // 方案3：fetch keepalive（页面关闭时也能发送）
+  fetch('/api/report', {
+    method: 'POST',
+    body: payload,
+    keepalive: true, // 关键：允许页面卸载后继续发送
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+// 采样策略（高流量场景）
+function shouldSample(type: string): boolean {
+  const sampleRates: Record<string, number> = {
+    js_error: 1,        // 错误 100% 上报
+    api_error: 1,       // API 错误 100% 上报
+    performance: 0.1,   // 性能数据 10% 采样
+    click: 0.01,        // 点击行为 1% 采样
+    page_view: 0.1,     // PV 10% 采样
+  };
+
+  return Math.random() < (sampleRates[type] ?? 0.1);
+}
+
+// 批量 + 压缩上报
+class ReportQueue {
+  private queue: any[] = [];
+  private maxSize = 20;
+  private flushInterval = 10000; // 10秒
+
+  constructor() {
+    setInterval(() => this.flush(), this.flushInterval);
+
+    // 页面卸载前强制上报
+    window.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        this.flush();
+      }
+    });
+  }
+
+  add(data: any) {
+    if (!shouldSample(data.type)) return;
+    this.queue.push({ ...data, timestamp: Date.now() });
+    if (this.queue.length >= this.maxSize) this.flush();
+  }
+
+  flush() {
+    if (this.queue.length === 0) return;
+    const batch = this.queue.splice(0);
+    navigator.sendBeacon('/api/report/batch', JSON.stringify(batch));
+  }
+}
+```
+
+### 5. SourceMap 错误还原
+
+生产环境代码经过压缩，错误堆栈中的行号、列号无法直接定位源码：
+
+```text
+线上报错堆栈：
+  TypeError: Cannot read property 'name' of undefined
+    at a.render (app.3f2a1b.js:1:28456)
+    at t.performUnitOfWork (vendor.9c8d3e.js:1:105432)
+
+还原后：
+  TypeError: Cannot read property 'name' of undefined
+    at UserProfile.render (src/components/UserProfile.tsx:42:18)
+    at performUnitOfWork (node_modules/react-dom/...)
+
+实现步骤：
+1. 构建时生成 SourceMap（但不上传到 CDN！）
+   // webpack.config.js
+   devtool: 'hidden-source-map' // 生成 .map 文件但不在 bundle 中引用
+
+2. 将 .map 文件上传到监控平台（Sentry、自建系统）
+   // CI/CD 中上传
+   sentry-cli releases files <version> upload-sourcemaps ./dist
+
+3. 监控平台收到错误后，用 source-map 库还原：
+   const { SourceMapConsumer } = require('source-map');
+   const consumer = await new SourceMapConsumer(sourceMapContent);
+   const original = consumer.originalPositionFor({
+     line: 1,
+     column: 28456,
+   });
+   // original = { source: 'src/components/UserProfile.tsx', line: 42, column: 18 }
+```
+
+### 6. 白屏检测
+
+```typescript
+// 方案1：DOM 检测法
+function checkWhiteScreen() {
+  // 页面加载完成后检测
+  setTimeout(() => {
+    const rootEl = document.getElementById('root');
+
+    // 检查根节点是否有内容
+    if (!rootEl || rootEl.children.length === 0) {
+      report({ type: 'white_screen', method: 'dom_check' });
+      return;
+    }
+
+    // 检查可视区域是否有内容（采样 17 个点）
+    const points = [
+      [window.innerWidth / 2, window.innerHeight / 2], // 中心
+      [window.innerWidth / 4, window.innerHeight / 4], // 四象限
+      // ... 更多采样点
+    ];
+
+    const emptyPoints = points.filter(([x, y]) => {
+      const el = document.elementFromPoint(x, y);
+      // 如果命中的是 html/body/root，说明没有内容
+      return !el || el === document.documentElement || el === document.body;
+    });
+
+    if (emptyPoints.length > points.length * 0.8) {
+      report({ type: 'white_screen', method: 'element_sampling' });
+    }
+  }, 3000); // 加载 3 秒后检测
+}
+
+// 方案2：MutationObserver 监听 DOM 变化
+function observeRender() {
+  const timer = setTimeout(() => {
+    report({ type: 'white_screen', method: 'mutation_timeout' });
+  }, 5000); // 5 秒内 DOM 无变化则判定白屏
+
+  const observer = new MutationObserver(() => {
+    const hasContent = document.getElementById('root')?.children.length > 0;
+    if (hasContent) {
+      clearTimeout(timer);
+      observer.disconnect();
+    }
+  });
+
+  observer.observe(document.body, { childList: true, subtree: true });
+}
+```
+
+## 深入追问
+
+### 监控 SDK 设计要点
+
+```text
+1. 非侵入性：不修改业务代码，通过劫持/代理实现
+2. 轻量化：SDK 体积 < 10KB（gzip），避免影响业务加载
+3. 异步加载：使用 async script 或动态 import
+4. 容错性：SDK 自身异常不能影响业务运行（try-catch 包裹所有逻辑）
+5. 可配置：采样率、上报地址、开关、自定义字段
+6. 用户隐私：脱敏处理、遵循 GDPR、不采集敏感信息
+
+架构：
+  SDK Core（错误捕获 + 性能采集 + 行为追踪）
+    → Reporter（上报策略：批量、采样、压缩）
+    → Transport（sendBeacon / fetch / Image）
+    → Server（数据清洗 → 存储 → 聚合 → 告警）
+    → Dashboard（可视化看板 + 错误详情 + 趋势图）
+```

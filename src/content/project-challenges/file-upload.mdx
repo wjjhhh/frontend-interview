@@ -1,0 +1,326 @@
+---
+title: "大文件上传与断点续传"
+description: "分片上传、断点续传、秒传、并发控制、进度追踪、Worker 计算 Hash"
+difficulty: "高级"
+tags: ["文件上传", "分片上传", "断点续传", "秒传", "并发控制"]
+category: "project-challenges"
+order: 2
+---
+
+## 问题背景
+
+上传大文件（数百 MB 甚至 GB 级别）时，直接使用 `FormData` 一次性上传会面临：超时断连、网络抖动丢失进度、浏览器内存溢出、无法暂停恢复等问题。核心难点是**如何可靠、高效地将大文件传输到服务端**。
+
+## 高频面试题
+
+### 1. 文件分片（Chunk）
+
+```typescript
+// 将大文件切片
+function createChunks(file: File, chunkSize = 5 * 1024 * 1024) {
+  const chunks: { blob: Blob; index: number }[] = [];
+  let index = 0;
+  let offset = 0;
+
+  while (offset < file.size) {
+    chunks.push({
+      blob: file.slice(offset, offset + chunkSize),
+      index: index++,
+    });
+    offset += chunkSize;
+  }
+
+  return chunks;
+}
+
+// 一个 200MB 的文件，按 5MB 分片 → 40 个 chunk
+// 每个 chunk 独立上传，失败只需重传该 chunk
+```
+
+### 2. 文件 Hash 计算（秒传关键）
+
+用 **Web Worker + SparkMD5** 计算文件指纹，避免阻塞 UI：
+
+```typescript
+// hash-worker.ts
+import SparkMD5 from 'spark-md5';
+
+self.onmessage = async (e) => {
+  const { chunks } = e.data;
+  const spark = new SparkMD5.ArrayBuffer();
+  let processed = 0;
+
+  for (const chunk of chunks) {
+    // FileReader 在 Worker 中也可用
+    const buffer = await chunk.arrayBuffer();
+    spark.append(buffer);
+    processed++;
+
+    // 上报进度
+    self.postMessage({
+      type: 'progress',
+      progress: Math.round((processed / chunks.length) * 100),
+    });
+  }
+
+  self.postMessage({
+    type: 'done',
+    hash: spark.end(),
+  });
+};
+
+// 主线程调用
+function calculateHash(file: File): Promise<string> {
+  return new Promise((resolve) => {
+    const chunks = createChunks(file);
+    const worker = new Worker(
+      new URL('./hash-worker.ts', import.meta.url),
+      { type: 'module' }
+    );
+
+    worker.onmessage = (e) => {
+      if (e.data.type === 'progress') {
+        console.log(`Hash 计算进度: ${e.data.progress}%`);
+      }
+      if (e.data.type === 'done') {
+        resolve(e.data.hash);
+        worker.terminate();
+      }
+    };
+
+    worker.postMessage({ chunks: chunks.map((c) => c.blob) });
+  });
+}
+```
+
+**抽样 Hash（大文件优化）：**
+
+```typescript
+// 对于超大文件（>1GB），全量 Hash 太慢
+// 策略：取首尾各 2MB + 中间每隔 N 个 chunk 取 2MB
+function createSampledChunks(file: File) {
+  const chunks: Blob[] = [];
+  const headSize = 2 * 1024 * 1024;
+  const tailSize = 2 * 1024 * 1024;
+  const sampleSize = 2 * 1024 * 1024;
+
+  // 首部
+  chunks.push(file.slice(0, headSize));
+
+  // 中间采样（每隔 10% 取一段）
+  const step = Math.floor(file.size / 10);
+  for (let i = step; i < file.size - tailSize; i += step) {
+    chunks.push(file.slice(i, i + sampleSize));
+  }
+
+  // 尾部
+  chunks.push(file.slice(file.size - tailSize));
+
+  // 加上文件大小作为额外信息，降低碰撞概率
+  return { chunks, fileSize: file.size };
+}
+```
+
+### 3. 秒传实现
+
+文件 Hash 相同说明服务端已有该文件，直接返回成功：
+
+```typescript
+async function uploadFile(file: File) {
+  // Step 1: 计算文件 Hash
+  const hash = await calculateHash(file);
+
+  // Step 2: 询问服务端是否已有该文件
+  const { data } = await axios.post('/api/upload/check', {
+    hash,
+    filename: file.name,
+    totalSize: file.size,
+  });
+
+  if (data.exists) {
+    // 秒传：服务端已有完整文件，直接返回 URL
+    return data.url;
+  }
+
+  // Step 3: 获取已上传的 chunk 列表（断点续传）
+  const uploadedChunks: number[] = data.uploadedChunks || [];
+
+  // Step 4: 只上传未完成的 chunk
+  const chunks = createChunks(file);
+  const pendingChunks = chunks.filter(
+    (chunk) => !uploadedChunks.includes(chunk.index)
+  );
+
+  await uploadChunks(pendingChunks, hash);
+
+  // Step 5: 通知服务端合并
+  const { data: result } = await axios.post('/api/upload/merge', {
+    hash,
+    filename: file.name,
+    totalChunks: chunks.length,
+  });
+
+  return result.url;
+}
+```
+
+### 4. 并发控制上传
+
+控制同时上传的 chunk 数量，避免浏览器连接数耗尽：
+
+```typescript
+// 通用并发控制器
+async function concurrentUpload(
+  tasks: (() => Promise<any>)[],
+  maxConcurrency = 3
+) {
+  const results: any[] = new Array(tasks.length);
+  let currentIndex = 0;
+  let completedCount = 0;
+
+  return new Promise((resolve, reject) => {
+    function runNext() {
+      if (completedCount === tasks.length) {
+        resolve(results);
+        return;
+      }
+
+      while (currentIndex < tasks.length) {
+        const index = currentIndex++;
+
+        tasks[index]()
+          .then((result) => {
+            results[index] = result;
+            completedCount++;
+            runNext(); // 完成一个任务后启动下一个
+          })
+          .catch(reject);
+
+        // 达到并发上限，停止启动新任务
+        if (currentIndex - completedCount >= maxConcurrency) break;
+      }
+    }
+
+    runNext();
+  });
+}
+
+// 上传 chunk 列表
+async function uploadChunks(
+  chunks: { blob: Blob; index: number }[],
+  hash: string
+) {
+  const tasks = chunks.map((chunk) => () => {
+    const formData = new FormData();
+    formData.append('chunk', chunk.blob);
+    formData.append('index', String(chunk.index));
+    formData.append('hash', hash);
+
+    return axios.post('/api/upload/chunk', formData, {
+      // 单个 chunk 的上传进度
+      onUploadProgress: (e) => {
+        const progress = Math.round((e.loaded / e.total!) * 100);
+        updateChunkProgress(chunk.index, progress);
+      },
+      // 失败重试
+    }).catch(() => retryUpload(chunk, hash, 3));
+  });
+
+  await concurrentUpload(tasks, 3);
+}
+```
+
+### 5. 暂停/恢复上传
+
+```typescript
+class UploadController {
+  private abortController: AbortController | null = null;
+  private uploadedChunks: Set<number> = new Set();
+  private paused = false;
+
+  pause() {
+    this.paused = true;
+    this.abortController?.abort(); // 取消正在进行的请求
+  }
+
+  resume(chunks: { blob: Blob; index: number }[], hash: string) {
+    this.paused = false;
+    this.abortController = new AbortController();
+
+    const pending = chunks.filter((c) => !this.uploadedChunks.has(c.index));
+    return this.uploadWithControl(pending, hash);
+  }
+
+  private async uploadWithControl(
+    chunks: { blob: Blob; index: number }[],
+    hash: string
+  ) {
+    for (const chunk of chunks) {
+      if (this.paused) return; // 检查暂停状态
+
+      const formData = new FormData();
+      formData.append('chunk', chunk.blob);
+      formData.append('index', String(chunk.index));
+      formData.append('hash', hash);
+
+      await axios.post('/api/upload/chunk', formData, {
+        signal: this.abortController!.signal,
+      });
+
+      this.uploadedChunks.add(chunk.index);
+    }
+  }
+}
+```
+
+### 6. 整体进度计算
+
+```typescript
+function useUploadProgress(totalChunks: number) {
+  // 每个 chunk 的独立进度
+  const [chunkProgress, setChunkProgress] = useState<Record<number, number>>({});
+
+  const updateChunkProgress = useCallback((index: number, progress: number) => {
+    setChunkProgress((prev) => ({ ...prev, [index]: progress }));
+  }, []);
+
+  // 总进度 = 所有 chunk 进度的加权平均
+  const totalProgress = useMemo(() => {
+    const total = Object.values(chunkProgress).reduce((a, b) => a + b, 0);
+    return Math.round(total / totalChunks);
+  }, [chunkProgress, totalChunks]);
+
+  return { totalProgress, updateChunkProgress };
+}
+```
+
+## 深入追问
+
+### 服务端合并 chunk 的实现思路
+
+```text
+1. 每个 chunk 以 hash_index 为文件名存储在临时目录
+   例：abc123_0, abc123_1, abc123_2, ...
+
+2. 收到 merge 请求后：
+   - 校验所有 chunk 是否齐全（0 到 totalChunks-1）
+   - 创建可写流（createWriteStream）
+   - 按 index 顺序读取每个 chunk，写入流
+   - 合并完成后删除临时 chunk 文件
+   - 对合并后的文件计算 Hash 校验完整性
+
+3. 异常处理：
+   - chunk 缺失 → 返回缺失列表，客户端重传
+   - 合并超时 → 后台异步合并，客户端轮询状态
+   - 磁盘空间不足 → 提前检查，返回错误
+```
+
+### 与后端配合的注意事项
+
+```text
+1. 协议约定：chunk 编号、Hash 算法、分片大小需前后端一致
+2. 幂等性：同一 chunk 重复上传不应产生副作用
+3. 过期清理：服务端需要定时清理超时未完成的 chunk
+4. 安全校验：文件类型、大小限制、Hash 校验
+5. 跨域配置：大文件上传可能需要调大 Nginx 的 client_max_body_size
+```

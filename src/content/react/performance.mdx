@@ -73,6 +73,71 @@ function App() {
 }
 ```
 
+**原理：谁的状态变了，谁重渲染；children 的创建者不受影响。**
+
+- `scrollTop` 变化 → `ScrollContainer` 重渲染 → 函数体重新执行
+- `children` 是从 `App` 作为 props 传入的，React 不会重新执行 `App`
+- 因此 `children` 对应的 JSX 对象引用未变 → React bailout，跳过 `HeavyComponent` 重渲染
+
+**React Bailout 机制**
+
+Bailout 是 React reconciler 在 diff 阶段的短路优化——当 React 判断一个子树不需要更新时，直接复用已有的 Fiber 节点，跳过整个子树的渲染。
+
+触发 bailout 需同时满足两个条件：
+
+| 条件 | 说明 |
+|------|------|
+| **props 引用不变** | 新旧 props 对象中每个字段的引用完全相同（`Object.is` 比较） |
+| **context 未变** | 组件订阅的所有 Context value 未发生变化 |
+
+React 内部有三条 bailout 路径，优先级从高到低：
+
+```
+1. eagerState bailout（useState/useReducer）
+   → setState 传入的值与当前 state 相同（Object.is）
+   → 在 setState 调用时立即短路，不产生任何 re-render
+
+2. 同类型 + props 未变 bailout
+   → reconcile 时发现新旧 element 类型相同，且所有 props 引用未变
+   → 跳过该组件函数执行，复用子树（本节"内容提升"利用的就是这条）
+
+3. React.memo bailout
+   → memo 包裹的组件在 reconcile 时做 props 浅比较
+   → 比较通过则跳过渲染（本质是在第 2 条之上加了显式的 props 比较逻辑）
+```
+
+**eagerState bailout 示例：**
+
+```tsx
+function Counter() {
+  const [count, setCount] = useState(0);
+
+  return (
+    <button onClick={() => setCount(0)}>  {/* count 已经是 0 */}
+      {count}
+    </button>
+  );
+  // 点击后：Object.is(0, 0) === true → eagerState bailout
+  // Counter 完全不重渲染，也不触发子组件渲染
+}
+```
+
+**为什么 children as props 能命中第 2 条：**
+
+```tsx
+// React.createElement 在编译时展开 JSX
+// <HeavyComponent /> 在 App 的渲染函数中只创建一次
+const element = React.createElement(HeavyComponent, null);
+// element 是一个普通对象 { type: HeavyComponent, props: {}, ... }
+
+// ScrollContainer 重渲染时，它收到的 children prop 仍是同一个对象引用
+// → type 相同（HeavyComponent）+ props 引用相同（{}） → 命中 bailout
+```
+
+对比 `React.memo`：
+- `memo` 通过 **props 浅比较** 跳过渲染（需要额外包裹）
+- 内容提升通过 **避免 JSX 对象重新创建** 跳过渲染，零额外开销
+
 **③ React.memo + useCallback/useMemo**
 
 ```tsx

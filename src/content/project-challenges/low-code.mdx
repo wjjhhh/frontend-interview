@@ -1,0 +1,470 @@
+---
+title: "低代码平台与可视化搭建"
+description: "Schema 驱动渲染、拖拽引擎、组件协议、撤销重做、DSL 设计、渲染引擎"
+difficulty: "高级"
+tags: ["低代码", "可视化搭建", "Schema驱动", "拖拽", "撤销重做", "DSL"]
+category: "project-challenges"
+order: 6
+---
+
+## 问题背景
+
+低代码平台允许用户通过拖拽、配置的方式快速搭建页面，减少重复开发。核心难点包括：**如何设计灵活的 Schema 协议、实现流畅的拖拽交互、保证渲染引擎的扩展性，以及处理撤销重做等复杂交互**。
+
+## 高频面试题
+
+### 1. Schema 协议设计
+
+页面描述用一棵 JSON 树（Schema）表示，渲染引擎根据 Schema 动态渲染组件：
+
+```typescript
+// Schema 节点定义
+interface SchemaNode {
+  id: string;                    // 唯一标识
+  componentName: string;         // 组件类型
+  props: Record<string, any>;    // 组件属性
+  children?: SchemaNode[];       // 子节点
+  styles?: React.CSSProperties;  // 样式
+  events?: Record<string, EventHandler>; // 事件绑定
+  condition?: Expression;        // 条件渲染
+  loop?: {                       // 循环渲染
+    dataSource: Expression;
+    itemName: string;
+  };
+}
+
+// 示例：一个表单页面的 Schema
+const pageSchema: SchemaNode = {
+  id: 'page-1',
+  componentName: 'Page',
+  props: { title: '用户注册' },
+  children: [
+    {
+      id: 'form-1',
+      componentName: 'Form',
+      props: { layout: 'vertical' },
+      children: [
+        {
+          id: 'input-1',
+          componentName: 'Input',
+          props: {
+            label: '用户名',
+            placeholder: '请输入用户名',
+            rules: [{ required: true, message: '必填' }],
+          },
+        },
+        {
+          id: 'select-1',
+          componentName: 'Select',
+          props: {
+            label: '角色',
+            options: [
+              { label: '管理员', value: 'admin' },
+              { label: '普通用户', value: 'user' },
+            ],
+          },
+        },
+        {
+          id: 'btn-1',
+          componentName: 'Button',
+          props: { type: 'primary', text: '提交' },
+          events: {
+            onClick: {
+              type: 'apiCall',
+              url: '/api/users',
+              method: 'POST',
+            },
+          },
+        },
+      ],
+    },
+  ],
+};
+```
+
+### 2. 渲染引擎实现
+
+根据 Schema 递归渲染组件树：
+
+```tsx
+// 组件注册表
+const componentRegistry = new Map<string, React.ComponentType<any>>();
+
+function registerComponent(name: string, component: React.ComponentType<any>) {
+  componentRegistry.set(name, component);
+}
+
+// 注册内置组件
+registerComponent('Page', PageComponent);
+registerComponent('Form', FormComponent);
+registerComponent('Input', InputComponent);
+registerComponent('Button', ButtonComponent);
+registerComponent('Table', TableComponent);
+
+// 渲染引擎核心
+function SchemaRenderer({ schema, context }: {
+  schema: SchemaNode;
+  context: RuntimeContext;
+}) {
+  const Component = componentRegistry.get(schema.componentName);
+
+  if (!Component) {
+    console.warn(`Unknown component: ${schema.componentName}`);
+    return null;
+  }
+
+  // 条件渲染
+  if (schema.condition) {
+    const visible = evaluateExpression(schema.condition, context);
+    if (!visible) return null;
+  }
+
+  // 事件绑定：将 Schema 中的事件描述转为真实的函数
+  const eventHandlers = {};
+  if (schema.events) {
+    for (const [eventName, handler] of Object.entries(schema.events)) {
+      eventHandlers[eventName] = createEventHandler(handler, context);
+    }
+  }
+
+  // 渲染子节点
+  const children = schema.children?.map((child) => {
+    // 循环渲染
+    if (child.loop) {
+      const dataSource = evaluateExpression(child.loop.dataSource, context);
+      return dataSource.map((item, index) => (
+        <SchemaRenderer
+          key={`${child.id}-${index}`}
+          schema={child}
+          context={{ ...context, [child.loop!.itemName]: item, index }}
+        />
+      ));
+    }
+
+    return (
+      <SchemaRenderer key={child.id} schema={child} context={context} />
+    );
+  });
+
+  return (
+    <Component
+      {...schema.props}
+      {...eventHandlers}
+      style={schema.styles}
+    >
+      {children}
+    </Component>
+  );
+}
+```
+
+### 3. 拖拽引擎
+
+```typescript
+// 基于 dnd-kit 实现拖拽搭建
+import {
+  DndContext,
+  DragOverlay,
+  useDraggable,
+  useDroppable,
+} from '@dnd-kit/core';
+
+// 物料面板中的可拖拽组件
+function MaterialItem({ componentName, icon, label }) {
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
+    id: `material-${componentName}`,
+    data: { type: 'material', componentName },
+  });
+
+  return (
+    <div ref={setNodeRef} {...attributes} {...listeners}
+      style={{ opacity: isDragging ? 0.5 : 1 }}
+    >
+      {icon} {label}
+    </div>
+  );
+}
+
+// 画布中的放置区域
+function CanvasDropZone({ node, onDrop }) {
+  const { setNodeRef, isOver } = useDroppable({
+    id: `drop-${node.id}`,
+    data: { targetId: node.id },
+  });
+
+  return (
+    <div ref={setNodeRef}
+      style={{ outline: isOver ? '2px dashed #1890ff' : 'none' }}
+    >
+      <SchemaRenderer schema={node} />
+    </div>
+  );
+}
+
+// 拖拽事件处理
+function EditorCanvas() {
+  const [schema, setSchema] = useState(initialSchema);
+
+  function handleDragEnd(event) {
+    const { active, over } = event;
+    if (!over) return;
+
+    const { type, componentName } = active.data.current;
+    const { targetId } = over.data.current;
+
+    if (type === 'material') {
+      // 从物料面板拖入画布：创建新节点
+      const newNode = {
+        id: generateId(),
+        componentName,
+        props: getDefaultProps(componentName),
+        children: [],
+      };
+      setSchema((prev) => insertNode(prev, targetId, newNode));
+    } else if (type === 'canvas-node') {
+      // 画布内拖拽排序：移动节点位置
+      setSchema((prev) => moveNode(prev, active.id, targetId));
+    }
+  }
+
+  return (
+    <DndContext onDragEnd={handleDragEnd}>
+      <MaterialPanel />
+      <Canvas schema={schema} />
+      <PropertyPanel />
+    </DndContext>
+  );
+}
+```
+
+### 4. 撤销/重做（Command Pattern）
+
+```typescript
+// 命令模式实现撤销重做
+interface Command {
+  execute(): void;
+  undo(): void;
+  description: string;
+}
+
+class CommandHistory {
+  private undoStack: Command[] = [];
+  private redoStack: Command[] = [];
+  private maxHistory = 50;
+
+  execute(command: Command) {
+    command.execute();
+    this.undoStack.push(command);
+    this.redoStack = []; // 新操作清空重做栈
+
+    if (this.undoStack.length > this.maxHistory) {
+      this.undoStack.shift();
+    }
+  }
+
+  undo() {
+    const command = this.undoStack.pop();
+    if (!command) return;
+    command.undo();
+    this.redoStack.push(command);
+  }
+
+  redo() {
+    const command = this.redoStack.pop();
+    if (!command) return;
+    command.execute();
+    this.undoStack.push(command);
+  }
+
+  get canUndo() { return this.undoStack.length > 0; }
+  get canRedo() { return this.redoStack.length > 0; }
+}
+
+// 具体命令实现
+class AddNodeCommand implements Command {
+  description = '添加组件';
+  constructor(
+    private store: SchemaStore,
+    private parentId: string,
+    private node: SchemaNode,
+    private index: number
+  ) {}
+
+  execute() {
+    this.store.insertNode(this.parentId, this.node, this.index);
+  }
+
+  undo() {
+    this.store.removeNode(this.node.id);
+  }
+}
+
+class UpdatePropsCommand implements Command {
+  description = '修改属性';
+  private prevProps: Record<string, any>;
+
+  constructor(
+    private store: SchemaStore,
+    private nodeId: string,
+    private newProps: Record<string, any>
+  ) {
+    this.prevProps = { ...store.getNode(nodeId).props };
+  }
+
+  execute() {
+    this.store.updateProps(this.nodeId, this.newProps);
+  }
+
+  undo() {
+    this.store.updateProps(this.nodeId, this.prevProps);
+  }
+}
+
+// 使用
+const history = new CommandHistory();
+
+// 添加组件
+history.execute(new AddNodeCommand(store, 'form-1', newInput, 0));
+
+// 修改属性
+history.execute(new UpdatePropsCommand(store, 'input-1', { label: '手机号' }));
+
+// 撤销
+history.undo(); // 属性恢复
+history.undo(); // 组件被移除
+
+// 重做
+history.redo(); // 组件重新添加
+```
+
+### 5. 表达式引擎
+
+支持在配置中写简单表达式，实现动态绑定：
+
+```typescript
+// 表达式示例：
+// "{{state.userName}}"               → 读取状态
+// "{{state.count > 10}}"             → 条件判断
+// "{{state.list.map(i => i.name)}}"  → 数据转换
+
+type Expression = string; // 以 {{ }} 包裹的表达式
+
+function evaluateExpression(expr: Expression, context: RuntimeContext): any {
+  if (!expr.startsWith('{{') || !expr.endsWith('}}')) {
+    return expr; // 普通字符串直接返回
+  }
+
+  const code = expr.slice(2, -2).trim();
+
+  // 安全沙箱执行（使用 new Function，限制可访问的变量）
+  const scopeKeys = Object.keys(context);
+  const scopeValues = Object.values(context);
+
+  try {
+    const fn = new Function(...scopeKeys, `return (${code})`);
+    return fn(...scopeValues);
+  } catch (error) {
+    console.warn(`Expression error: ${code}`, error);
+    return undefined;
+  }
+}
+
+// 运行时上下文
+interface RuntimeContext {
+  state: Record<string, any>;  // 页面状态
+  props: Record<string, any>;  // 组件 props
+  utils: {                     // 工具函数
+    formatDate: (date: string) => string;
+    request: (url: string, options?: any) => Promise<any>;
+  };
+}
+```
+
+### 6. 出码能力（Schema → 源代码）
+
+将 Schema 转换为真实的 React/Vue 项目代码：
+
+```typescript
+// Schema → React 源代码
+function generateCode(schema: SchemaNode, indent = 0): string {
+  const pad = '  '.repeat(indent);
+  const Component = schema.componentName;
+
+  // 生成 props 字符串
+  const propsStr = Object.entries(schema.props || {})
+    .map(([key, value]) => {
+      if (typeof value === 'string') return `${key}="${value}"`;
+      return `${key}={${JSON.stringify(value)}}`;
+    })
+    .join(' ');
+
+  // 递归生成子节点
+  const childrenStr = schema.children
+    ?.map((child) => generateCode(child, indent + 1))
+    .join('\n');
+
+  if (childrenStr) {
+    return `${pad}<${Component} ${propsStr}>\n${childrenStr}\n${pad}</${Component}>`;
+  }
+
+  return `${pad}<${Component} ${propsStr} />`;
+}
+
+// 生成完整文件
+function generateFile(pageSchema: SchemaNode): string {
+  const imports = collectImports(pageSchema);
+
+  return `
+import React from 'react';
+${imports.map((i) => `import { ${i.components.join(', ')} } from '${i.source}';`).join('\n')}
+
+export default function Page() {
+  return (
+${generateCode(pageSchema, 2)}
+  );
+}
+`.trim();
+}
+```
+
+## 深入追问
+
+### 低代码平台架构分层
+
+```text
+┌────────────────────────────────────────────────────┐
+│  编辑器层（Designer）                                │
+│  物料面板 │ 画布编辑器 │ 属性面板 │ 大纲树 │ 代码编辑  │
+├────────────────────────────────────────────────────┤
+│  协议层（Schema Protocol）                           │
+│  组件协议 │ 事件协议 │ 数据源协议 │ 样式协议          │
+├────────────────────────────────────────────────────┤
+│  引擎层（Engine）                                    │
+│  渲染引擎 │ 拖拽引擎 │ 表达式引擎 │ 数据引擎         │
+├────────────────────────────────────────────────────┤
+│  出码层（Code Generator）                            │
+│  React 出码 │ Vue 出码 │ 小程序出码                   │
+├────────────────────────────────────────────────────┤
+│  运行时（Runtime）                                   │
+│  组件库 │ 工具函数 │ 状态管理 │ API 网关              │
+└────────────────────────────────────────────────────┘
+```
+
+### 性能优化策略
+
+```text
+1. 画布渲染优化
+   - 大量组件时使用虚拟渲染（只渲染可视区域的组件）
+   - 拖拽过程中用占位符代替真实组件渲染
+   - Schema 变更时 diff 计算，局部更新
+
+2. 编辑器响应优化
+   - 属性变更防抖（输入框 300ms debounce）
+   - Schema 操作使用 Immer 实现不可变更新
+   - 大型 Schema 树使用 Web Worker 处理序列化/校验
+
+3. 预览/发布优化
+   - Schema 静态分析，提前 Tree Shaking 未使用的组件
+   - 预览模式去掉编辑器相关代码（拖拽、选中框等）
+   - 出码后的代码走标准构建流程（Webpack/Vite）
+```

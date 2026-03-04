@@ -10,7 +10,7 @@ const defaultCategoryMeta: Record<string, CategoryMeta> = {
   typescript: { name: "TypeScript", description: "类型体操、泛型、装饰器、类型推导", icon: "file-type", order: 2 },
   react: { name: "React", description: "Fiber架构、Hooks原理、性能优化、并发模式", icon: "atom", order: 3 },
   vue: { name: "Vue", description: "响应式原理、Diff算法、Composition API", icon: "layout-template", order: 4 },
-  css: { name: "CSS 布局", description: "BFC、Flex/Grid、响应式、CSS变量、动画", icon: "palette", order: 5 },
+  css: { name: "CSS 布局", description: "BFC、Flex/Grid、响应式、CSS Modules、CSS-in-JS、TailwindCSS、UnoCSS", icon: "palette", order: 5 },
   engineering: { name: "工程化", description: "Webpack/Vite原理、Tree Shaking、Module Federation", icon: "settings", order: 6 },
   performance: { name: "性能优化", description: "首屏优化、懒加载、缓存策略、Web Vitals", icon: "zap", order: 7 },
   network: { name: "网络与安全", description: "HTTP/2/3、HTTPS、跨域、XSS/CSRF", icon: "globe", order: 8 },
@@ -21,6 +21,7 @@ const defaultCategoryMeta: Record<string, CategoryMeta> = {
   miniprogram: { name: "小程序", description: "双线程模型、生命周期、setData优化、分包加载、跨端框架", icon: "smartphone", order: 13 },
   "ai-agent": { name: "AI Agent", description: "LLM集成、流式响应、Tool Calling、RAG、Prompt工程、MCP协议", icon: "bot", order: 14 },
   web3: { name: "Web3 开发", description: "区块链基础、钱包连接、ethers.js/viem、wagmi、智能合约交互", icon: "link", order: 15 },
+  "project-challenges": { name: "项目难点", description: "大数据渲染、大文件上传、权限系统、实时协同、前端监控、低代码搭建", icon: "flame", order: 16 },
 };
 
 export function getCategories(): CategoryInfo[] {

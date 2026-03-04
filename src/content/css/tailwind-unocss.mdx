@@ -1,0 +1,552 @@
+---
+title: "原子化 CSS 深度解析：TailwindCSS vs UnoCSS"
+description: "JIT 编译原理、PurgeCSS、UnoCSS 规则引擎、性能对比与工程化配置"
+difficulty: "高级"
+tags: ["TailwindCSS", "UnoCSS", "原子化CSS", "JIT", "PostCSS", "性能优化"]
+category: "css"
+order: 3
+---
+
+## 原子化 CSS 的核心理念
+
+传统 CSS 思维：语义化命名 + 组件化样式
+
+```css
+/* 语义化：每个类描述"是什么" */
+.card { padding: 16px; border-radius: 8px; }
+.card-title { font-size: 18px; font-weight: bold; }
+```
+
+原子化 CSS 思维：功能化命名 + 单一职责
+
+```css
+/* 原子化：每个类只做一件事 */
+.p-4   { padding: 16px; }
+.rounded-lg { border-radius: 8px; }
+.text-lg { font-size: 18px; }
+.font-bold { font-weight: bold; }
+```
+
+**核心优势：**
+
+```text
+1. 复用率极高：10个组件共用同一个 .flex，只生成一次 CSS
+2. 按需生成：只有用到的类才会出现在最终 CSS 中
+3. 约束设计系统：间距/颜色/字号来自统一 Token，UI 一致性强
+4. 无命名负担：不用再为 .container-wrapper-inner 这种名字发愁
+```
+
+### 什么是设计 Token？
+
+设计 Token 是设计系统中**最小的、有命名的设计决策单元**——把颜色、间距、字号、圆角等规范抽象成一组有名字的变量：
+
+```text
+颜色 token:   brand-primary   = #3b82f6
+             brand-secondary = #6366f1
+             text-muted      = #6b7280
+
+间距 token:   spacing-1 = 4px
+             spacing-2 = 8px
+             spacing-4 = 16px
+
+字号 token:   text-sm   = 14px
+             text-base = 16px
+             text-lg   = 18px
+```
+
+Tailwind 的类名本质就是 token 的映射：
+
+```html
+<!-- bg-blue-500 → 颜色 token  -->
+<!-- p-4         → 间距 token (16px) -->
+<!-- text-lg     → 字号 token (18px) -->
+<button class="bg-blue-500 p-4 text-lg">Submit</button>
+```
+
+**Token 带来约束，约束带来一致性**：开发者只能从预定义的 token 中选值，而不是随意写 `padding: 13px` 或 `color: #3b83f7`（差一点的蓝），整个项目的 UI 自然保持统一。
+
+在 `tailwind.config.ts` 的 `theme` 中定义的就是项目的 token 体系：
+
+```javascript
+theme: {
+  extend: {
+    colors: {
+      // 语义化 token（推荐）：名字描述用途，而非颜色本身
+      primary: '#3b82f6',        // 主色
+      'primary-hover': '#2563eb',
+      destructive: '#ef4444',    // 危险/删除
+      'text-muted': '#6b7280',   // 次要文字
+
+      // 而非 blue-500: '#3b82f6'（描述颜色值，不描述用途）
+    },
+    spacing: {
+      // 在 4px 基准上扩展
+      '18': '4.5rem',  // 72px
+      '128': '32rem',  // 512px
+    },
+  },
+},
+```
+
+## 高频面试题
+
+### 1. TailwindCSS JIT 原理
+
+Tailwind v3 之前（非 JIT）：
+
+```text
+构建时生成全量 CSS（约 3MB）
+  → PurgeCSS 扫描模板文件，删除未使用的类
+  → 最终产物几十 KB
+
+问题：
+  - 开发模式也要加载 3MB CSS，DevTools 卡顿
+  - 不支持动态类名（如 text-[#ff0000]）
+  - 配置需要枚举所有变体，生成大量组合
+```
+
+**JIT（Just-In-Time）模式（v3 默认）：**
+
+```text
+实时扫描源文件，发现用到什么类，即时生成对应 CSS
+
+文件变动 → Tailwind 解析类名 → 生成最小 CSS → HMR 推送
+
+优点：
+  ✓ 开发模式 CSS 极小（只有用到的类）
+  ✓ 支持任意值：p-[13px]、text-[#ff6600]、grid-cols-[200px_1fr]
+  ✓ 支持任意变体：hover:、focus:、dark:、md: 任意组合
+  ✓ 无需配置 variants（所有变体自动支持）
+```
+
+**JIT 扫描机制：**
+
+```javascript
+// tailwind.config.js
+module.exports = {
+  // content 告诉 Tailwind 去哪里扫描类名
+  content: [
+    './src/**/*.{html,js,ts,jsx,tsx,vue,svelte}',
+    // 也可以扫描 node_modules 中的组件库
+    './node_modules/my-ui-lib/dist/**/*.js',
+  ],
+
+  // 注意：不能用动态拼接的类名！
+  // ❌ const cls = `text-${color}-500`  → Tailwind 扫描不到完整类名
+  // ✅ const cls = color === 'red' ? 'text-red-500' : 'text-blue-500'
+};
+```
+
+**任意值语法：**
+
+```html
+<!-- 任意数值 -->
+<div class="w-[320px] h-[calc(100vh-64px)]">
+
+<!-- 任意颜色 -->
+<p class="text-[#ff6600] bg-[rgb(0,0,255)]">
+
+<!-- CSS 变量 -->
+<div class="bg-[--brand-color]">
+
+<!-- 任意属性（方括号内写完整 CSS 属性） -->
+<div class="[writing-mode:vertical-lr] [&>*]:flex">
+
+<!-- 任意变体 -->
+<div class="[@media(min-width:1400px)]:grid-cols-4">
+```
+
+### 2. TailwindCSS 配置与主题定制
+
+```javascript
+// tailwind.config.ts
+import type { Config } from 'tailwindcss';
+
+const config: Config = {
+  content: ['./src/**/*.{ts,tsx}'],
+  darkMode: 'class', // 通过 class="dark" 切换暗色模式
+
+  theme: {
+    // extend：在默认主题基础上扩展（不覆盖）
+    extend: {
+      colors: {
+        brand: {
+          50: '#eff6ff',
+          500: '#3b82f6',
+          900: '#1e3a8a',
+        },
+        // 使用 CSS 变量支持动态主题
+        primary: 'hsl(var(--color-primary) / <alpha-value>)',
+      },
+
+      spacing: {
+        '128': '32rem',
+        '144': '36rem',
+      },
+
+      fontFamily: {
+        sans: ['Inter', 'system-ui', 'sans-serif'],
+      },
+
+      animation: {
+        'fade-in': 'fadeIn 0.3s ease-in-out',
+        'slide-up': 'slideUp 0.4s ease-out',
+      },
+
+      keyframes: {
+        fadeIn: {
+          '0%': { opacity: '0' },
+          '100%': { opacity: '1' },
+        },
+        slideUp: {
+          '0%': { transform: 'translateY(20px)', opacity: '0' },
+          '100%': { transform: 'translateY(0)', opacity: '1' },
+        },
+      },
+    },
+  },
+
+  plugins: [
+    // 官方插件
+    require('@tailwindcss/forms'),
+    require('@tailwindcss/typography'),  // prose 排版类
+    require('@tailwindcss/aspect-ratio'),
+
+    // 自定义插件
+    function ({ addUtilities, addComponents, theme }) {
+      // 添加自定义工具类
+      addUtilities({
+        '.scrollbar-hide': {
+          '-ms-overflow-style': 'none',
+          'scrollbar-width': 'none',
+          '&::-webkit-scrollbar': { display: 'none' },
+        },
+      });
+
+      // 添加组件类（可被工具类覆盖）
+      addComponents({
+        '.btn': {
+          padding: `${theme('spacing.2')} ${theme('spacing.4')}`,
+          borderRadius: theme('borderRadius.md'),
+          fontWeight: theme('fontWeight.semibold'),
+        },
+      });
+    },
+  ],
+};
+
+export default config;
+```
+
+**@apply 提取重复组合：**
+
+```css
+/* 当多个地方用完全相同的类组合时，考虑用 @apply 抽取 */
+/* 但不要滥用，否则失去原子化的优势 */
+
+@layer components {
+  .btn-primary {
+    @apply px-4 py-2 bg-brand-500 text-white rounded-md font-semibold
+           hover:bg-brand-600 focus:outline-none focus:ring-2 focus:ring-brand-500
+           disabled:opacity-50 disabled:cursor-not-allowed
+           transition-colors duration-200;
+  }
+}
+```
+
+### 3. UnoCSS 核心设计
+
+UnoCSS 由 Vite 团队的 Anthony Fu 开发，定位是**原子化 CSS 引擎**（不是框架）。
+
+**与 Tailwind 的核心区别：**
+
+```text
+TailwindCSS：
+  - 基于 PostCSS 插件
+  - 内置固定的设计系统（spacing scale、color palette）
+  - 配置驱动扩展
+
+UnoCSS：
+  - 基于 Vite 插件 / PostCSS（框架无关）
+  - 不内置任何规则，通过「预设」组合功能
+  - 规则引擎驱动：正则匹配 → 动态生成 CSS
+  - 性能极致：纯 JS 生成，无 PostCSS 解析开销
+```
+
+**UnoCSS 规则引擎：**
+
+```typescript
+// uno.config.ts
+import { defineConfig, presetUno, presetAttributify, presetIcons } from 'unocss';
+
+export default defineConfig({
+  // 预设组合（核心）
+  presets: [
+    presetUno(),          // Tailwind/Windi 兼容预设
+    presetAttributify(),  // 属性化模式
+    presetIcons({         // 图标（支持所有 iconify 图标）
+      scale: 1.2,
+      cdn: 'https://esm.sh/',
+    }),
+  ],
+
+  // 自定义规则：正则匹配 → 生成 CSS
+  rules: [
+    // 静态规则
+    ['flex-center', { display: 'flex', 'justify-content': 'center', 'align-items': 'center' }],
+
+    // 动态规则（正则捕获组）
+    [/^m-(\d+)$/, ([, d]) => ({ margin: `${Number(d) * 4}px` })],
+    [/^text-(.+)$/, ([, c], { theme }) => {
+      if (theme.colors[c]) return { color: theme.colors[c] };
+    }],
+
+    // 复杂动态规则
+    [/^grid-(\d+)$/, ([, n]) => ({
+      display: 'grid',
+      'grid-template-columns': `repeat(${n}, minmax(0, 1fr))`,
+    })],
+  ],
+
+  // 自定义快捷方式（类似 @apply）
+  shortcuts: {
+    'flex-center': 'flex justify-center items-center',
+    'btn': 'px-4 py-2 rounded font-semibold cursor-pointer',
+    'btn-primary': 'btn bg-blue-500 text-white hover:bg-blue-600',
+
+    // 动态快捷方式
+    [/^card-(.+)$/, ([, c]) => `p-4 rounded-lg shadow bg-${c}-50 border border-${c}-200`],
+  },
+
+  // 自定义变体（相当于 Tailwind 的 variant）
+  variants: [
+    // 自定义 hocus: 变体（hover 或 focus）
+    (matcher) => {
+      if (!matcher.startsWith('hocus:')) return matcher;
+      return {
+        matcher: matcher.slice(6),
+        selector: (s) => `${s}:hover, ${s}:focus`,
+      };
+    },
+  ],
+
+  theme: {
+    colors: {
+      brand: '#3b82f6',
+    },
+  },
+});
+```
+
+**属性化模式（presetAttributify）：**
+
+```html
+<!-- 普通写法 -->
+<div class="flex items-center gap-4 p-4 bg-white rounded-lg shadow">
+
+<!-- 属性化写法：按语义分组，可读性更强 -->
+<div
+  flex items-center gap-4
+  p-4
+  bg-white rounded-lg shadow
+>
+
+<!-- 避免长 class 字符串，适合复杂组件 -->
+<button
+  text="sm white"
+  font="bold"
+  bg="blue-500 hover:blue-600"
+  p="x-4 y-2"
+  rounded
+>
+  Submit
+</button>
+```
+
+**图标集成（presetIcons）：**
+
+```html
+<!-- 使用任意 iconify 图标，无需安装图标库 -->
+<span class="i-carbon-sun text-2xl text-yellow-500" />
+<span class="i-heroicons-check-circle text-green-500" />
+<span class="i-mdi-github text-xl" />
+
+<!-- 按需加载，只有用到的图标才会打包 -->
+```
+
+### 4. TailwindCSS vs UnoCSS 性能对比
+
+```text
+指标                    TailwindCSS v3        UnoCSS
+────────────────────────────────────────────────────────
+引擎                    PostCSS               纯 JS（无 AST 解析）
+冷启动（大型项目）        ~200ms               ~15ms（快 10x+）
+HMR 更新速度            毫秒级               亚毫秒级
+最终 CSS 体积           相似（都按需生成）    相似
+配置灵活性              较高                  极高（规则引擎）
+生态/文档               非常完善             较完善但较新
+学习曲线                中等                  稍高（规则引擎概念）
+IDE 支持                优秀（官方插件）       良好
+```
+
+**TailwindCSS v4（2025）的变化：**
+
+```css
+/* v4 用纯 CSS 配置，不再需要 tailwind.config.js */
+@import "tailwindcss";
+
+@theme {
+  --color-brand: #3b82f6;
+  --font-sans: 'Inter', system-ui;
+  --spacing-128: 32rem;
+}
+```
+
+```text
+v4 性能提升：
+  - 新的 Oxide 引擎（Rust 实现），比 v3 快 5x
+  - 全量增量构建
+  - 零配置，CSS 即配置文件
+```
+
+## 深入追问
+
+### 如何在组件库中使用 TailwindCSS？
+
+```text
+问题：组件库的 Tailwind 配置可能与使用方的配置冲突
+
+方案一：CSS 变量 + Tailwind 主题桥接
+  组件库只使用 CSS 变量（不硬编码 Tailwind 颜色）
+  使用方通过 Tailwind 主题映射变量
+
+方案二：预构建组件样式
+  组件库发布时用 Tailwind 预构建 CSS
+  使用方直接引入 CSS，不依赖 Tailwind
+
+方案三：tailwind-merge + cva
+  用 tailwind-merge 解决类名冲突
+  用 cva（class-variance-authority）管理变体
+```
+
+```typescript
+// tailwind-merge：解决类名覆盖问题
+import { twMerge } from 'tailwind-merge';
+import { cva, type VariantProps } from 'class-variance-authority';
+
+// cva：声明式管理组件变体
+const buttonVariants = cva(
+  // 基础类（始终应用）
+  'inline-flex items-center justify-center rounded-md font-semibold transition-colors',
+  {
+    variants: {
+      variant: {
+        primary: 'bg-blue-500 text-white hover:bg-blue-600',
+        secondary: 'bg-gray-100 text-gray-900 hover:bg-gray-200',
+        destructive: 'bg-red-500 text-white hover:bg-red-600',
+        ghost: 'hover:bg-gray-100',
+      },
+      size: {
+        sm: 'h-8 px-3 text-sm',
+        md: 'h-10 px-4',
+        lg: 'h-12 px-6 text-lg',
+      },
+    },
+    defaultVariants: {
+      variant: 'primary',
+      size: 'md',
+    },
+  }
+);
+
+interface ButtonProps
+  extends React.ButtonHTMLAttributes<HTMLButtonElement>,
+    VariantProps<typeof buttonVariants> {
+  className?: string;
+}
+
+export const Button = ({ variant, size, className, ...props }: ButtonProps) => (
+  <button
+    // twMerge 确保外部 className 能正确覆盖内部样式
+    className={twMerge(buttonVariants({ variant, size }), className)}
+    {...props}
+  />
+);
+
+// 使用
+<Button variant="primary" size="lg" className="w-full">
+  Submit
+</Button>
+```
+
+### 原子化 CSS 的局限性
+
+```text
+1. 动态样式限制
+   ❌ `bg-${color}-500`  不会被 JIT 扫描到
+   ✅ 用 style 属性或 CSS 变量处理真正动态的值
+
+2. 复杂 CSS 难以表达
+   伪元素内容（content: "..."）、复杂动画、
+   CSS 计数器等，仍需自定义 CSS
+
+3. HTML 可读性下降
+   类名堆积，JSX 组件需配合 clsx/cva 管理
+
+4. 设计系统约束
+   - 优点：强制遵循设计 Token，UI 一致性好
+   - 缺点：设计稿与 Tailwind scale 对不上时，
+     需要大量 arbitrary values
+
+5. 团队协作
+   需要全员熟悉工具类，学习成本约 1-2 周
+```
+
+### 如何在 Next.js / SSR 中正确使用 TailwindCSS？
+
+```javascript
+// Next.js 中无需额外配置，Tailwind 完全支持 SSR
+// CSS 在构建时生成，不存在运行时注水问题
+
+// next.config.js（通常无需额外配置）
+/** @type {import('next').NextConfig} */
+const nextConfig = {};
+export default nextConfig;
+
+// 只需确保 tailwind.config.ts 的 content 包含 app/ 目录
+module.exports = {
+  content: [
+    './app/**/*.{ts,tsx}',
+    './components/**/*.{ts,tsx}',
+    './src/**/*.{ts,tsx}',
+  ],
+};
+```
+
+```typescript
+// 暗色模式 + RSC 兼容方案
+// app/layout.tsx
+export default function RootLayout({ children }) {
+  return (
+    // 通过 class 控制暗色模式（不依赖 JS 状态）
+    <html lang="zh" className="dark">
+      <body className="bg-white dark:bg-gray-900 text-gray-900 dark:text-white">
+        {children}
+      </body>
+    </html>
+  );
+}
+
+// 用 next-themes 动态切换（客户端）
+'use client';
+import { useTheme } from 'next-themes';
+
+export const ThemeToggle = () => {
+  const { theme, setTheme } = useTheme();
+  return (
+    <button onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>
+      {theme === 'dark' ? '🌙' : '☀️'}
+    </button>
+  );
+};
+```

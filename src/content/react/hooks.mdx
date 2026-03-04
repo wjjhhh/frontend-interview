@@ -397,30 +397,136 @@ function ContactForm() {
 }
 ```
 
+### 10. Tearing（撕裂）问题与 useSyncExternalStore
+
+**Tearing** 是并发模式下特有的问题：React 渲染可以暂停、恢复，若外部 store 在暂停期间发生变化，同一次渲染中不同组件可能读到不同时刻的值。
+
+```
+时间轴：
+
+  t=0  React 开始渲染，ComponentA 读取 store.value = 1
+  t=1  React 暂停，让出控制权给浏览器
+  t=2  用户操作触发 store.value 变为 2
+  t=3  React 恢复，ComponentB 读取 store.value = 2
+  t=4  提交 DOM
+
+结果：ComponentA 显示 1，ComponentB 显示 2 ← 同一次渲染，数据撕裂
+```
+
+**为什么 `useState` 不会 tearing？**
+
+React 内部状态由 React 自身调度，渲染开始前就确定了这次渲染使用哪个版本的状态，中途不会变。外部 store（localStorage、Redux、Zustand 等）不受 React 控制，React 无法保证其一致性。
+
+**`useSyncExternalStore` 的解决机制：**
+
+```javascript
+// 核心：快照验证
+// 1. 渲染开始时记录 snapshot
+// 2. 渲染结束后再次调用 getSnapshot
+// 3. 两次不一致 → 丢弃本次渲染，强制同步重渲染
+// 4. 一致 → 提交 DOM
+```
+
+这就是名字里 **Sync** 的含义——强制打断并发渲染，走同步路径，确保所有组件看到同一份数据。
+
+**触发 Tearing 的条件：**
+
+| 条件 | 说明 |
+|------|------|
+| 并发渲染（Concurrent Mode） | React 18 默认开启 |
+| 外部可变 store | 不受 React 调度控制的状态 |
+| 渲染中途 store 发生变化 | 暂停期间被其他任务修改 |
+
+**不会 Tearing 的情况：**
+- React 内部 state（`useState` / `useReducer`）
+- 用 `useSyncExternalStore` 包装过的外部 store
+- Legacy 同步渲染模式（但放弃了并发特性）
+
+> Redux、Zustand、Jotai 等主流状态库在 React 18 中均已迁移至 `useSyncExternalStore`。
+
 ## 手写练习
 
 > 实现 `useLocalStorage`，状态持久化到 localStorage：
 
 ```javascript
+// 模块级订阅器，所有组件共享同一份
+const subscribers = new Map(); // Map<key, Set<callback>>
+
+function emitChange(key) {
+  subscribers.get(key)?.forEach((cb) => cb());
+}
+
+function subscribeKey(key, callback) {
+  if (!subscribers.has(key)) subscribers.set(key, new Set());
+  subscribers.get(key).add(callback);
+  return () => subscribers.get(key).delete(callback);
+}
+
 function useLocalStorage(key, initialValue) {
-  const [storedValue, setStoredValue] = useState(() => {
+  // 返回原始 JSON 字符串作为 snapshot
+  // 字符串是值类型，useSyncExternalStore 用 Object.is 比较不会误触发
+  const getSnapshot = useCallback(() => {
     try {
-      const item = localStorage.getItem(key);
-      return item ? JSON.parse(item) : initialValue;
+      return localStorage.getItem(key);
+    } catch {
+      return null;
+    }
+  }, [key]);
+
+  const subscribe = useCallback(
+    (callback) => {
+      // 同 tab 跨组件同步
+      const unsubSameTab = subscribeKey(key, callback);
+      // 跨 tab 同步（浏览器原生只在其他 tab 触发）
+      const handleStorage = (e) => {
+        if (e.key === key) callback();
+      };
+      window.addEventListener("storage", handleStorage);
+      return () => {
+        unsubSameTab();
+        window.removeEventListener("storage", handleStorage);
+      };
+    },
+    [key]
+  );
+
+  const rawValue = useSyncExternalStore(
+    subscribe,
+    getSnapshot,
+    () => null // SSR fallback
+  );
+
+  // rawValue 变化时才重新 parse，避免每次渲染都产生新对象引用
+  const storedValue = useMemo(() => {
+    if (rawValue === null) return initialValue;
+    try {
+      return JSON.parse(rawValue);
     } catch {
       return initialValue;
     }
-  });
+  }, [rawValue, initialValue]);
 
   const setValue = useCallback(
     (value) => {
-      const valueToStore = value instanceof Function
-        ? value(storedValue)
-        : value;
-      setStoredValue(valueToStore);
-      localStorage.setItem(key, JSON.stringify(valueToStore));
+      try {
+        // 直接读 localStorage 获取最新值，不依赖 storedValue
+        const current = (() => {
+          try {
+            const raw = localStorage.getItem(key);
+            return raw !== null ? JSON.parse(raw) : initialValue;
+          } catch {
+            return initialValue;
+          }
+        })();
+        const valueToStore =
+          value instanceof Function ? value(current) : value;
+        localStorage.setItem(key, JSON.stringify(valueToStore));
+        emitChange(key); // 通知同 tab 的所有订阅者
+      } catch (error) {
+        console.error("useLocalStorage write error:", error);
+      }
     },
-    [key, storedValue]
+    [key, initialValue] // 不依赖 storedValue，setValue 引用更稳定
   );
 
   return [storedValue, setValue];

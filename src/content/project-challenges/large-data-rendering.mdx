@@ -1,0 +1,373 @@
+---
+title: "大数据量渲染与性能优化"
+description: "虚拟滚动、时间分片、Web Worker、Canvas 渲染、增量渲染策略"
+difficulty: "高级"
+tags: ["虚拟滚动", "时间分片", "Web Worker", "Canvas渲染", "性能优化"]
+category: "project-challenges"
+order: 1
+---
+
+## 问题背景
+
+前端经常面对大量数据渲染场景：10 万行表格、树形组织架构、大型可视化图表等。直接渲染会导致页面卡顿甚至崩溃。核心难点是**如何在不阻塞主线程的前提下，流畅地展示和交互大量数据**。
+
+## 高频面试题
+
+### 1. 虚拟滚动（Virtual Scroll）
+
+核心思想：**只渲染可视区域内的 DOM 节点**，通过监听滚动事件动态替换渲染内容。
+
+```tsx
+// 手写简易虚拟滚动（定高场景）
+function VirtualList({ items, itemHeight, containerHeight }) {
+  const [scrollTop, setScrollTop] = useState(0);
+  const containerRef = useRef(null);
+
+  // 计算可视范围
+  const startIndex = Math.floor(scrollTop / itemHeight);
+  const endIndex = Math.min(
+    startIndex + Math.ceil(containerHeight / itemHeight) + 1,
+    items.length
+  );
+  const visibleItems = items.slice(startIndex, endIndex);
+
+  // 总高度（撑开滚动条）
+  const totalHeight = items.length * itemHeight;
+  // 可见区域偏移量
+  const offsetY = startIndex * itemHeight;
+
+  return (
+    <div
+      ref={containerRef}
+      style={{ height: containerHeight, overflow: 'auto' }}
+      onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+    >
+      {/* 占位容器：撑开完整高度 */}
+      <div style={{ height: totalHeight, position: 'relative' }}>
+        {/* 可见内容：绝对定位到正确偏移 */}
+        <div style={{ position: 'absolute', top: offsetY, width: '100%' }}>
+          {visibleItems.map((item, i) => (
+            <div key={startIndex + i} style={{ height: itemHeight }}>
+              {item.content}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+**不定高虚拟滚动的难点与解决：**
+
+```tsx
+// 不定高方案核心思路：
+// 1. 预估高度 → 先用预估值渲染
+// 2. 实际测量 → 渲染后通过 ResizeObserver 获取真实高度
+// 3. 缓存高度 → 存入 heightCache Map
+// 4. 修正偏移 → 根据真实高度重新计算 scrollTop
+
+// 使用 @tanstack/react-virtual 处理不定高
+import { useVirtualizer } from '@tanstack/react-virtual';
+
+function DynamicHeightList({ items }) {
+  const parentRef = useRef(null);
+
+  const virtualizer = useVirtualizer({
+    count: items.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 80,   // 预估高度
+    overscan: 5,               // 缓冲区
+    // 关键：measureElement 会自动用 ResizeObserver 测量真实高度
+  });
+
+  return (
+    <div ref={parentRef} style={{ height: '600px', overflow: 'auto' }}>
+      <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
+        {virtualizer.getVirtualItems().map((virtualRow) => (
+          <div
+            key={virtualRow.key}
+            ref={virtualizer.measureElement} // 自动测量
+            data-index={virtualRow.index}
+            style={{
+              position: 'absolute',
+              top: 0,
+              transform: `translateY(${virtualRow.start}px)`,
+              width: '100%',
+            }}
+          >
+            <ItemCard data={items[virtualRow.index]} />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+### 2. 时间分片（Time Slicing）
+
+当需要一次性渲染大量 DOM 时，用时间分片将任务拆分到多个帧中执行，避免长时间阻塞主线程：
+
+```javascript
+// 方案1：requestIdleCallback（利用浏览器空闲时间）
+function renderChunked(items, renderItem, chunkSize = 100) {
+  let index = 0;
+
+  function processChunk(deadline) {
+    // deadline.timeRemaining() 返回当前帧剩余空闲时间
+    while (index < items.length && deadline.timeRemaining() > 1) {
+      const end = Math.min(index + chunkSize, items.length);
+      for (let i = index; i < end; i++) {
+        renderItem(items[i]);
+      }
+      index = end;
+    }
+
+    if (index < items.length) {
+      requestIdleCallback(processChunk);
+    }
+  }
+
+  requestIdleCallback(processChunk);
+}
+
+// 方案2：MessageChannel（比 setTimeout 更精确，React Scheduler 的实现方式）
+function timeSlice(tasks) {
+  const channel = new MessageChannel();
+  let index = 0;
+
+  channel.port2.onmessage = () => {
+    const startTime = performance.now();
+    // 每次执行 5ms 以内的任务（留出时间给浏览器渲染）
+    while (index < tasks.length && performance.now() - startTime < 5) {
+      tasks[index]();
+      index++;
+    }
+    if (index < tasks.length) {
+      channel.port1.postMessage(null); // 下一帧继续
+    }
+  };
+
+  channel.port1.postMessage(null); // 启动
+}
+```
+
+### 3. Web Worker 离线计算
+
+将 CPU 密集型任务（排序、过滤、聚合计算）移到 Worker 线程，不阻塞 UI：
+
+```typescript
+// worker.ts
+self.onmessage = (e) => {
+  const { type, data } = e.data;
+
+  switch (type) {
+    case 'sort': {
+      // 在 Worker 中执行百万级排序
+      const sorted = data.sort((a, b) => a.value - b.value);
+      self.postMessage({ type: 'sorted', data: sorted });
+      break;
+    }
+    case 'filter': {
+      const { items, keyword } = data;
+      const filtered = items.filter((item) =>
+        item.name.toLowerCase().includes(keyword.toLowerCase())
+      );
+      self.postMessage({ type: 'filtered', data: filtered });
+      break;
+    }
+    case 'aggregate': {
+      // 大数据聚合统计
+      const result = data.reduce((acc, item) => {
+        acc[item.category] = (acc[item.category] || 0) + item.amount;
+        return acc;
+      }, {});
+      self.postMessage({ type: 'aggregated', data: result });
+      break;
+    }
+  }
+};
+
+// 主线程中使用
+function useWorkerCompute() {
+  const workerRef = useRef<Worker>();
+
+  useEffect(() => {
+    workerRef.current = new Worker(
+      new URL('./worker.ts', import.meta.url),
+      { type: 'module' }
+    );
+    return () => workerRef.current?.terminate();
+  }, []);
+
+  const compute = useCallback((type, data) => {
+    return new Promise((resolve) => {
+      const worker = workerRef.current!;
+      const handler = (e) => {
+        worker.removeEventListener('message', handler);
+        resolve(e.data.data);
+      };
+      worker.addEventListener('message', handler);
+      worker.postMessage({ type, data });
+    });
+  }, []);
+
+  return compute;
+}
+
+// 使用示例
+function DataTable({ rawData }) {
+  const [sorted, setSorted] = useState([]);
+  const compute = useWorkerCompute();
+
+  const handleSort = async () => {
+    // 100万条数据排序在 Worker 中执行，UI 不卡顿
+    const result = await compute('sort', rawData);
+    setSorted(result);
+  };
+}
+```
+
+### 4. Canvas 渲染大量元素
+
+当 DOM 节点超过上万个（如组织架构图、甘特图），可用 Canvas 替代 DOM 渲染：
+
+```typescript
+// Canvas 表格渲染核心逻辑
+class CanvasTable {
+  private ctx: CanvasRenderingContext2D;
+  private data: any[][];
+  private scrollTop = 0;
+  private rowHeight = 30;
+  private visibleRows: number;
+
+  constructor(canvas: HTMLCanvasElement, data: any[][]) {
+    this.ctx = canvas.getContext('2d')!;
+    this.data = data;
+    this.visibleRows = Math.ceil(canvas.height / this.rowHeight) + 1;
+
+    // 监听滚动（用 wheel 事件模拟）
+    canvas.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      this.scrollTop = Math.max(0,
+        Math.min(this.scrollTop + e.deltaY,
+          (this.data.length - this.visibleRows) * this.rowHeight
+        )
+      );
+      this.render();
+    });
+  }
+
+  render() {
+    const { ctx, data, rowHeight, scrollTop } = this;
+    const startRow = Math.floor(scrollTop / rowHeight);
+    const offsetY = -(scrollTop % rowHeight);
+
+    ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+
+    for (let i = 0; i < this.visibleRows; i++) {
+      const rowIndex = startRow + i;
+      if (rowIndex >= data.length) break;
+
+      const y = offsetY + i * rowHeight;
+      // 绘制行背景
+      ctx.fillStyle = rowIndex % 2 === 0 ? '#fff' : '#f9f9f9';
+      ctx.fillRect(0, y, ctx.canvas.width, rowHeight);
+
+      // 绘制文字
+      ctx.fillStyle = '#333';
+      ctx.fillText(data[rowIndex].join('  |  '), 10, y + 20);
+    }
+  }
+}
+
+// 搭配 React 使用
+function CanvasGrid({ data }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    if (!canvasRef.current) return;
+    const table = new CanvasTable(canvasRef.current, data);
+    table.render();
+  }, [data]);
+
+  return <canvas ref={canvasRef} width={800} height={600} />;
+}
+```
+
+### 5. 增量渲染 + 骨架屏
+
+首屏先渲染骨架，数据到达后分批渲染，减少白屏时间：
+
+```tsx
+function IncrementalList({ fetchData }) {
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    // 流式获取数据（Server-Sent Events / ReadableStream）
+    const reader = fetchData();
+    const decoder = new TextDecoder();
+
+    async function read() {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = JSON.parse(decoder.decode(value));
+        // 每收到一批数据就追加渲染
+        setItems((prev) => [...prev, ...chunk]);
+      }
+      setLoading(false);
+    }
+
+    read();
+  }, [fetchData]);
+
+  return (
+    <div>
+      {items.map((item) => (
+        <Card key={item.id} data={item} />
+      ))}
+      {loading && <Skeleton count={5} />}
+    </div>
+  );
+}
+```
+
+## 深入追问
+
+### 虚拟滚动 vs 分页：如何选择？
+
+```text
+虚拟滚动                          分页
+─────────────────────────        ─────────────────────────
+用户体验更流畅（无感知加载）      实现简单，兼容性好
+适合浏览型场景（信息流、日志）    适合精确定位场景（表格数据）
+SEO 不友好（动态渲染）            SEO 友好（每页有独立 URL）
+实现复杂（不定高、横向滚动）      后端分页压力更可控
+内存占用稳定                      可支持直接跳转到某页
+
+实际项目中推荐：
+- 内部管理系统、日志面板 → 虚拟滚动
+- 面向用户的列表页 → 分页 + 预加载
+- 信息流（社交、新闻）→ 虚拟滚动 + 无限加载
+```
+
+### 百万级树形数据如何渲染？
+
+```text
+1. 扁平化处理：树形数据转为一维数组 + depth 字段
+2. 虚拟滚动：对扁平化后的数组做虚拟滚动
+3. 按需展开：折叠节点不计入渲染列表，展开时才插入子节点
+4. 搜索优化：Worker 中执行树搜索，匹配后展开路径上所有祖先节点
+5. 缓存策略：展开/折叠状态用 Set 缓存，避免重复计算
+
+伪代码：
+  flatList = tree.flatten()         // [{ id, depth, hasChildren, expanded }]
+  visibleList = flatList.filter(    // 过滤出展开的节点
+    node => ancestors(node).every(a => a.expanded)
+  )
+  <VirtualList items={visibleList} /> // 虚拟滚动渲染
+```

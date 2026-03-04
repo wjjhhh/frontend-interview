@@ -1,0 +1,385 @@
+---
+title: "实时通信与协同编辑"
+description: "WebSocket、SSE、长轮询、CRDT、OT算法、协同编辑冲突解决"
+difficulty: "高级"
+tags: ["WebSocket", "SSE", "协同编辑", "CRDT", "OT算法", "实时通信"]
+category: "project-challenges"
+order: 4
+---
+
+## 问题背景
+
+实时场景在前端越来越常见：在线文档协同编辑、IM 聊天、实时数据看板、多人白板、直播弹幕等。核心难点是**如何保持客户端与服务端的低延迟数据同步，以及多用户同时编辑时如何解决冲突**。
+
+## 高频面试题
+
+### 1. 实时通信方案对比
+
+```text
+方案                 延迟     双向    连接数    适用场景
+──────────────────  ────     ────    ──────    ─────────────────────
+短轮询（Polling）    高       ✗      频繁建连    简单通知（兼容性好）
+长轮询（Long Poll）  中等     ✗      保持连接    消息推送（HTTP/1.1 环境）
+SSE                  低       ✗      单向持久    实时看板、日志流、AI 流式输出
+WebSocket            极低     ✓      双向持久    聊天、协同编辑、游戏
+WebTransport         极低     ✓      基于HTTP/3  下一代实时通信（实验中）
+```
+
+### 2. WebSocket 封装（心跳 + 重连）
+
+```typescript
+class WebSocketClient {
+  private ws: WebSocket | null = null;
+  private url: string;
+  private heartbeatTimer?: ReturnType<typeof setInterval>;
+  private reconnectTimer?: ReturnType<typeof setTimeout>;
+  private reconnectAttempts = 0;
+  private maxReconnects = 5;
+  private listeners = new Map<string, Set<Function>>();
+
+  constructor(url: string) {
+    this.url = url;
+    this.connect();
+  }
+
+  private connect() {
+    this.ws = new WebSocket(this.url);
+
+    this.ws.onopen = () => {
+      this.reconnectAttempts = 0;
+      this.startHeartbeat();
+      this.emit('connected');
+    };
+
+    this.ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      if (data.type === 'pong') return; // 心跳响应
+      this.emit(data.type, data.payload);
+    };
+
+    this.ws.onclose = (event) => {
+      this.stopHeartbeat();
+      if (!event.wasClean) this.reconnect();
+    };
+
+    this.ws.onerror = () => {
+      this.ws?.close();
+    };
+  }
+
+  private startHeartbeat() {
+    this.heartbeatTimer = setInterval(() => {
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ type: 'ping' }));
+      }
+    }, 30000); // 每 30 秒发送心跳
+  }
+
+  private stopHeartbeat() {
+    clearInterval(this.heartbeatTimer);
+  }
+
+  private reconnect() {
+    if (this.reconnectAttempts >= this.maxReconnects) {
+      this.emit('max_reconnect');
+      return;
+    }
+
+    // 指数退避重连
+    const delay = Math.min(1000 * 2 ** this.reconnectAttempts, 30000);
+    this.reconnectAttempts++;
+
+    this.reconnectTimer = setTimeout(() => {
+      this.emit('reconnecting', this.reconnectAttempts);
+      this.connect();
+    }, delay);
+  }
+
+  send(type: string, payload: any) {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type, payload }));
+    }
+  }
+
+  on(event: string, callback: Function) {
+    if (!this.listeners.has(event)) {
+      this.listeners.set(event, new Set());
+    }
+    this.listeners.get(event)!.add(callback);
+  }
+
+  private emit(event: string, data?: any) {
+    this.listeners.get(event)?.forEach((cb) => cb(data));
+  }
+
+  destroy() {
+    this.stopHeartbeat();
+    clearTimeout(this.reconnectTimer);
+    this.ws?.close();
+    this.listeners.clear();
+  }
+}
+```
+
+### 3. Server-Sent Events（SSE）
+
+适合服务端单向推送场景，如 AI 流式响应、实时日志：
+
+```typescript
+// 客户端
+function useSSE(url: string) {
+  const [data, setData] = useState(null);
+  const [status, setStatus] = useState<'connecting' | 'open' | 'closed'>('connecting');
+
+  useEffect(() => {
+    const eventSource = new EventSource(url);
+
+    eventSource.onopen = () => setStatus('open');
+
+    // 监听不同类型的事件
+    eventSource.addEventListener('message', (e) => {
+      setData(JSON.parse(e.data));
+    });
+
+    eventSource.addEventListener('notification', (e) => {
+      showNotification(JSON.parse(e.data));
+    });
+
+    eventSource.onerror = () => {
+      setStatus('closed');
+      eventSource.close();
+    };
+
+    return () => eventSource.close();
+  }, [url]);
+
+  return { data, status };
+}
+
+// AI 流式响应（Fetch + ReadableStream）
+async function streamChat(prompt: string, onChunk: (text: string) => void) {
+  const response = await fetch('/api/chat', {
+    method: 'POST',
+    body: JSON.stringify({ prompt }),
+    headers: { 'Content-Type': 'application/json' },
+  });
+
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    const chunk = decoder.decode(value, { stream: true });
+    // SSE 格式：data: {...}\n\n
+    const lines = chunk.split('\n').filter((line) => line.startsWith('data: '));
+    for (const line of lines) {
+      const data = JSON.parse(line.slice(6));
+      onChunk(data.content);
+    }
+  }
+}
+```
+
+### 4. 协同编辑：OT 算法
+
+OT（Operational Transformation）是 Google Docs 使用的协同算法，通过**转换操作**来解决冲突：
+
+```typescript
+// 操作类型定义
+type Operation =
+  | { type: 'insert'; position: number; text: string }
+  | { type: 'delete'; position: number; length: number };
+
+// OT 转换核心：当两个操作并发时，转换其中一个使结果一致
+function transform(op1: Operation, op2: Operation): Operation {
+  // op1 是本地操作，op2 是远端操作
+  // 返回转换后的 op1'，使得 apply(apply(doc, op2), op1') === apply(apply(doc, op1), op2')
+
+  if (op1.type === 'insert' && op2.type === 'insert') {
+    // 两个插入：如果 op2 在 op1 前面，op1 位置后移
+    if (op2.position <= op1.position) {
+      return { ...op1, position: op1.position + op2.text.length };
+    }
+    return op1;
+  }
+
+  if (op1.type === 'insert' && op2.type === 'delete') {
+    if (op2.position < op1.position) {
+      // 删除在插入前面：插入位置前移
+      return {
+        ...op1,
+        position: Math.max(op2.position, op1.position - op2.length),
+      };
+    }
+    return op1;
+  }
+
+  if (op1.type === 'delete' && op2.type === 'insert') {
+    if (op2.position <= op1.position) {
+      return { ...op1, position: op1.position + op2.text.length };
+    }
+    return op1;
+  }
+
+  // delete vs delete：需要处理重叠
+  if (op1.type === 'delete' && op2.type === 'delete') {
+    if (op2.position >= op1.position + op1.length) {
+      return op1; // 无重叠
+    }
+    if (op2.position + op2.length <= op1.position) {
+      return { ...op1, position: op1.position - op2.length };
+    }
+    // 有重叠：缩减 op1 的删除范围
+    // ...（实际实现需处理多种重叠情况）
+    return op1;
+  }
+
+  return op1;
+}
+```
+
+### 5. 协同编辑：CRDT
+
+CRDT（Conflict-free Replicated Data Type）是无冲突的数据结构，**不需要中心服务器协调**：
+
+```typescript
+// Yjs：最流行的 CRDT 协同库
+// 核心概念：每个字符有唯一 ID（clientId + clock），天然有序
+
+import * as Y from 'yjs';
+import { WebsocketProvider } from 'y-websocket';
+
+// 创建共享文档
+const ydoc = new Y.Doc();
+const ytext = ydoc.getText('editor'); // 共享文本类型
+
+// 连接到同步服务器
+const provider = new WebsocketProvider(
+  'wss://your-server.com',
+  'room-name',
+  ydoc
+);
+
+// 监听远端变化
+ytext.observe((event) => {
+  // event.delta 描述了变更：[{ retain: 5 }, { insert: 'hello' }]
+  applyDeltaToEditor(event.delta);
+});
+
+// 本地编辑
+ytext.insert(0, 'Hello ');     // 在位置 0 插入
+ytext.delete(6, 5);            // 从位置 6 删除 5 个字符
+
+// 感知（Awareness）：显示其他用户的光标位置
+const awareness = provider.awareness;
+awareness.setLocalState({
+  user: { name: 'Alice', color: '#ff0000' },
+  cursor: { anchor: 10, head: 15 }, // 选区
+});
+
+awareness.on('change', () => {
+  const states = awareness.getStates(); // Map<clientId, state>
+  renderRemoteCursors(states);
+});
+```
+
+```text
+OT vs CRDT 对比：
+───────────────────────────────────────────────
+OT                           CRDT
+依赖中心服务器协调            无需中心协调，P2P 可行
+转换逻辑复杂，边界情况多      数据结构本身保证一致性
+内存占用较小                  需要存储额外元数据（ID、墓碑）
+Google Docs 采用              Figma、Notion 采用
+
+现代项目推荐 CRDT（Yjs/Automerge），
+生态成熟，已有 y-prosemirror、y-monaco 等编辑器绑定
+```
+
+### 6. 在线状态与光标同步
+
+```typescript
+// 多人协作中的在线状态管理
+function useCollaborators(roomId: string) {
+  const [collaborators, setCollaborators] = useState<Map<string, UserState>>(new Map());
+
+  useEffect(() => {
+    const ws = new WebSocketClient(`wss://api.example.com/rooms/${roomId}`);
+
+    // 定期同步自己的状态
+    const syncInterval = setInterval(() => {
+      ws.send('cursor', {
+        position: editor.getCursorPosition(),
+        selection: editor.getSelection(),
+        viewport: editor.getVisibleRange(),
+      });
+    }, 50); // 50ms 节流
+
+    // 接收他人状态
+    ws.on('cursor', (data) => {
+      setCollaborators((prev) => {
+        const next = new Map(prev);
+        next.set(data.userId, {
+          ...data,
+          lastSeen: Date.now(),
+        });
+        return next;
+      });
+    });
+
+    ws.on('user_leave', (data) => {
+      setCollaborators((prev) => {
+        const next = new Map(prev);
+        next.delete(data.userId);
+        return next;
+      });
+    });
+
+    return () => {
+      clearInterval(syncInterval);
+      ws.destroy();
+    };
+  }, [roomId]);
+
+  return collaborators;
+}
+```
+
+## 深入追问
+
+### WebSocket 与 HTTP/2 Server Push 的区别
+
+```text
+WebSocket                         HTTP/2 Server Push
+───────────────────────           ───────────────────────
+独立的 ws:// 协议                  基于 HTTP/2 的 PUSH_PROMISE
+全双工，客户端可主动发送           服务端主动推送资源（CSS/JS）
+适用于持续双向通信                 适用于预加载静态资源
+需要单独的握手和维护连接           复用已有的 HTTP/2 连接
+聊天、协同、游戏                   页面资源预推送
+
+注意：HTTP/2 Server Push 并非用于实时通信，
+Chrome 已在 2022 年移除了对它的支持。
+实时推送应使用 WebSocket 或 SSE。
+```
+
+### 弱网环境下的消息可靠性
+
+```text
+1. 消息确认机制（ACK）
+   客户端发送消息 → 服务端返回 ACK → 客户端标记已发送
+   超时未 ACK → 自动重发
+
+2. 消息序号（Sequence Number）
+   每条消息带递增序号 → 接收方检测是否漏消息
+   发现序号间断 → 主动请求重发
+
+3. 本地缓存 + 离线队列
+   断网时消息存入 IndexedDB → 重连后批量发送
+
+4. 幂等设计
+   每条消息有唯一 ID（msgId）→ 服务端去重
+   重发不会产生重复消息
+```

@@ -1,0 +1,355 @@
+---
+title: "前端权限系统设计"
+description: "RBAC/ABAC 模型、路由权限、菜单权限、按钮级权限、数据权限、Token 管理"
+difficulty: "高级"
+tags: ["权限系统", "RBAC", "路由守卫", "按钮权限", "Token刷新"]
+category: "project-challenges"
+order: 3
+---
+
+## 问题背景
+
+中后台系统中，不同角色的用户能看到不同的页面、菜单和按钮。权限控制需要覆盖**路由级**（能否访问某页面）、**菜单级**（侧边栏显示哪些入口）、**按钮级**（是否可操作某功能）和**数据级**（能看到哪些数据）。核心难点是**如何设计一套灵活、可维护、前后端协作的权限体系**。
+
+## 高频面试题
+
+### 1. 权限模型：RBAC vs ABAC
+
+```text
+RBAC（基于角色的访问控制）
+───────────────────────────
+用户 → 角色 → 权限
+
+示例：
+  用户 Alice → 角色 admin → 权限 [user:create, user:delete, order:view, ...]
+  用户 Bob   → 角色 editor → 权限 [article:create, article:edit, ...]
+
+优点：简单直观，适合大多数中后台系统
+缺点：角色膨胀（角色数 = 权限组合数）
+
+ABAC（基于属性的访问控制）
+───────────────────────────
+基于用户属性、资源属性、环境条件做动态判断
+
+示例：
+  规则：department === "finance" && resource.type === "report" && time.hour >= 9
+  → 允许财务部员工在工作时间访问报表
+
+优点：极其灵活
+缺点：实现复杂，规则维护成本高
+
+实际项目：RBAC 为主 + 少量 ABAC 规则（如数据权限）
+```
+
+### 2. 动态路由权限
+
+后端返回用户权限列表，前端根据权限动态生成路由：
+
+```typescript
+// 路由配置（含权限标识）
+const allRoutes = [
+  { path: '/dashboard', component: Dashboard, permission: 'dashboard:view' },
+  { path: '/users', component: UserList, permission: 'user:list' },
+  { path: '/users/create', component: UserCreate, permission: 'user:create' },
+  { path: '/settings', component: Settings, permission: 'settings:view' },
+  { path: '/reports', component: Reports, permission: 'report:view' },
+];
+
+// 根据权限过滤路由
+function filterRoutes(routes, permissions: Set<string>) {
+  return routes.filter((route) => {
+    if (!route.permission) return true; // 无权限要求的公共路由
+    return permissions.has(route.permission);
+  });
+}
+
+// React Router 动态路由
+function AppRouter() {
+  const { permissions, loading } = useAuth();
+
+  if (loading) return <FullPageLoader />;
+
+  const accessibleRoutes = filterRoutes(allRoutes, new Set(permissions));
+
+  return (
+    <Routes>
+      {accessibleRoutes.map((route) => (
+        <Route key={route.path} path={route.path} element={<route.component />} />
+      ))}
+      {/* 无权限页面统一重定向到 403 */}
+      <Route path="*" element={<Forbidden />} />
+    </Routes>
+  );
+}
+```
+
+### 3. 菜单权限控制
+
+菜单数据由后端返回或前端根据权限过滤：
+
+```typescript
+// 方案1：后端直接返回用户可见的菜单树
+interface MenuItem {
+  key: string;
+  label: string;
+  icon: string;
+  path?: string;
+  children?: MenuItem[];
+}
+
+// 登录后获取菜单
+const { data: menuTree } = await axios.get('/api/user/menus');
+// menuTree 已经是过滤后的结果，前端直接渲染
+
+// 方案2：前端根据权限过滤（更灵活，支持前端自定义菜单结构）
+const fullMenu: MenuItem[] = [
+  {
+    key: 'user-management',
+    label: '用户管理',
+    icon: 'users',
+    children: [
+      { key: 'user-list', label: '用户列表', path: '/users', permission: 'user:list' },
+      { key: 'role-list', label: '角色管理', path: '/roles', permission: 'role:list' },
+    ],
+  },
+  {
+    key: 'content',
+    label: '内容管理',
+    icon: 'file-text',
+    children: [
+      { key: 'articles', label: '文章管理', path: '/articles', permission: 'article:list' },
+    ],
+  },
+];
+
+function filterMenu(menu: MenuItem[], permissions: Set<string>): MenuItem[] {
+  return menu
+    .map((item) => {
+      // 有子菜单：递归过滤
+      if (item.children) {
+        const filteredChildren = filterMenu(item.children, permissions);
+        // 子菜单全部被过滤掉 → 父菜单也不显示
+        if (filteredChildren.length === 0) return null;
+        return { ...item, children: filteredChildren };
+      }
+      // 叶子菜单：检查权限
+      if (item.permission && !permissions.has(item.permission)) return null;
+      return item;
+    })
+    .filter(Boolean) as MenuItem[];
+}
+```
+
+### 4. 按钮级权限控制
+
+```tsx
+// 方案1：权限指令/组件
+function Authorized({
+  permission,
+  children,
+  fallback = null,
+}: {
+  permission: string;
+  children: React.ReactNode;
+  fallback?: React.ReactNode;
+}) {
+  const { permissions } = useAuth();
+
+  if (!permissions.has(permission)) {
+    return fallback;
+  }
+
+  return <>{children}</>;
+}
+
+// 使用
+function UserList() {
+  return (
+    <div>
+      <Table dataSource={users} />
+
+      <Authorized permission="user:create">
+        <Button type="primary">新增用户</Button>
+      </Authorized>
+
+      <Authorized
+        permission="user:export"
+        fallback={<Tooltip title="无导出权限"><Button disabled>导出</Button></Tooltip>}
+      >
+        <Button>导出数据</Button>
+      </Authorized>
+    </div>
+  );
+}
+
+// 方案2：Hook 方式（更灵活，可用于非 JSX 场景）
+function usePermission() {
+  const { permissions } = useAuth();
+
+  return {
+    has: (perm: string) => permissions.has(perm),
+    hasAny: (perms: string[]) => perms.some((p) => permissions.has(p)),
+    hasAll: (perms: string[]) => perms.every((p) => permissions.has(p)),
+  };
+}
+
+function OrderPage() {
+  const { has } = usePermission();
+
+  const columns = [
+    { title: '订单号', dataIndex: 'orderNo' },
+    { title: '金额', dataIndex: 'amount' },
+    // 有权限才显示操作列
+    ...(has('order:edit')
+      ? [{ title: '操作', render: (record) => <EditButton record={record} /> }]
+      : []),
+  ];
+
+  return <Table columns={columns} />;
+}
+```
+
+### 5. Token 管理与无感刷新
+
+```typescript
+// Access Token 短期有效（15min），Refresh Token 长期有效（7d）
+
+// Axios 拦截器实现无感刷新
+let isRefreshing = false;
+let waitQueue: ((token: string) => void)[] = [];
+
+axios.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const { config, response } = error;
+
+    if (response?.status !== 401 || config._retry) {
+      return Promise.reject(error);
+    }
+
+    // 正在刷新中，将请求排队
+    if (isRefreshing) {
+      return new Promise((resolve) => {
+        waitQueue.push((newToken) => {
+          config.headers.Authorization = `Bearer ${newToken}`;
+          config._retry = true;
+          resolve(axios(config));
+        });
+      });
+    }
+
+    isRefreshing = true;
+
+    try {
+      // 用 Refresh Token 换取新 Access Token
+      const { data } = await axios.post('/api/auth/refresh', {
+        refreshToken: getRefreshToken(),
+      });
+
+      const newToken = data.accessToken;
+      setAccessToken(newToken);
+
+      // 重新执行队列中的请求
+      waitQueue.forEach((cb) => cb(newToken));
+      waitQueue = [];
+
+      // 重试原始请求
+      config.headers.Authorization = `Bearer ${newToken}`;
+      config._retry = true;
+      return axios(config);
+    } catch (refreshError) {
+      // Refresh Token 也过期 → 跳转登录
+      waitQueue = [];
+      logout();
+      return Promise.reject(refreshError);
+    } finally {
+      isRefreshing = false;
+    }
+  }
+);
+```
+
+### 6. 路由守卫（统一入口）
+
+```tsx
+// 全局路由守卫组件
+function AuthGuard({ children }: { children: React.ReactNode }) {
+  const { user, loading } = useAuth();
+  const location = useLocation();
+
+  if (loading) return <FullPageLoader />;
+
+  // 未登录 → 重定向到登录页（携带来源 URL）
+  if (!user) {
+    return <Navigate to="/login" state={{ from: location.pathname }} replace />;
+  }
+
+  return <>{children}</>;
+}
+
+// 权限守卫（检查页面级权限）
+function PermissionGuard({
+  permission,
+  children,
+}: {
+  permission: string;
+  children: React.ReactNode;
+}) {
+  const { permissions } = useAuth();
+
+  if (!permissions.has(permission)) {
+    return <Forbidden />;
+  }
+
+  return <>{children}</>;
+}
+
+// 路由配置中使用
+<Route
+  path="/admin"
+  element={
+    <AuthGuard>
+      <PermissionGuard permission="admin:access">
+        <AdminLayout />
+      </PermissionGuard>
+    </AuthGuard>
+  }
+/>
+```
+
+## 深入追问
+
+### 前端权限控制的安全性
+
+```text
+前端权限控制只是 UX 优化（控制 UI 展示），不是安全措施！
+
+真正的安全保障在后端：
+1. 每个 API 都必须校验 Token + 权限（即使前端隐藏了按钮）
+2. 前端代码可被篡改（DevTools 修改、直接调用 API）
+3. 前端权限 = 提升用户体验（不展示无权操作的入口）
+4. 后端权限 = 真正的安全防线（拒绝无权请求）
+
+面试常见追问：
+Q: "如果用户直接在浏览器地址栏输入无权限的页面 URL 怎么办？"
+A: 路由守卫会拦截并显示 403 页面，同时后端 API 也会拒绝返回数据。
+```
+
+### 权限数据何时获取？
+
+```text
+方案1：登录时返回（推荐）
+  登录 → 返回 Token + 用户信息 + 权限列表 + 菜单数据
+  优点：减少请求次数
+  缺点：权限变更需重新登录
+
+方案2：路由跳转前获取
+  每次路由变化 → 请求最新权限 → 判断是否放行
+  优点：权限实时生效
+  缺点：每次导航多一次请求
+
+方案3：混合方案（实际使用最多）
+  登录时获取权限 → 缓存在内存/Store
+  Token 刷新时同步更新权限
+  关键操作前实时校验（如审批、支付）
+```
